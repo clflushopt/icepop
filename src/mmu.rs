@@ -1,4 +1,4 @@
-//! Software based memory management for Icepop using byte level permissions.
+//! Software based memory management for Icepop.
 
 /// Permission bytes are assigned to single bytes and define the permissions
 /// on a that byte.
