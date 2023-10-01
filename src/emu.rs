@@ -1,5 +1,5 @@
 //! 64-bit RISC-V RV64i emulator.
-use crate::mmu::{Mmu};
+use crate::mmu::Mmu;
 
 /// RISC-V 64-bit has 33 64-bit wide registers.
 const MAX_REGISTERS: usize = 33;
@@ -52,4 +52,3 @@ pub enum Register {
     T6,
     Pc,
 }
-
