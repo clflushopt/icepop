@@ -1,5 +1,5 @@
 # icepop
 
-icepop is a RV64i emulator written in Rust with just-in-time dynamic binary
-translation to ARM64.
+icepop is an emulator for RISC-V (RV64i extension) with a JIT designed
+for fuzzing binary targets.
 
