@@ -2,7 +2,7 @@
 use crate::mmu::Mmu;
 
 /// RISC-V 64-bit has 33 64-bit wide registers.
-const MAX_REGISTERS: usize = 33;
+const MAX_CPU_REGISTERS: usize = 33;
 
 /// Single threaded RISC-V RV64i emulator with an MMU.
 pub struct Emulator {
@@ -10,7 +10,7 @@ pub struct Emulator {
     pub memory: Mmu,
 
     /// RV64i register state.
-    registers: [u64; MAX_REGISTERS],
+    registers: [u64; MAX_CPU_REGISTERS],
 }
 
 /// 64-bit RISC-V registers.
