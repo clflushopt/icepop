@@ -181,47 +181,54 @@ impl Mmu {
         // Fetch permission bits of the memory region we are trying
         // to read from.
         /*
-        let perms = self
-            .permissions
-            .get(addr.0..addr.0.checked_add(buf.len())?)?;
+         let perms = self
+             .permissions
+             .get(addr.0..addr.0.checked_add(buf.len())?)?;
 
-        let mut has_raw = false;
-        // Check memory region has READ bit set.
-        if !perms.iter().all(|x| (x.0 & PERM_READ) != 0) {
-            return None;
-        }
+         let mut has_raw = false;
+         // Check memory region has READ bit set.
+         if !perms.iter().all(|x| (x.0 & PERM_READ) != 0) {
+             return None;
+         }
 
-        buf.copy_from_slice(
-            self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?,
-        );
-        Some(())
-       e*/
+         buf.copy_from_slice(
+             self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?,
+         );
+         Some(())
+        e*/
 
-        self.read_into_perms(addr,buf,Permission(PERM_READ))
+        self.read_into_perms(addr, buf, Permission(PERM_READ))
     }
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf`.
-    pub fn read_into_perms(&self, addr: VirtAddr, buf: &mut [u8], expected_permissions: Permission) -> Option<()> {
+    pub fn read_into_perms(
+        &self,
+        addr: VirtAddr,
+        buf: &mut [u8],
+        expected_permissions: Permission,
+    ) -> Option<()> {
         // Fetch permission bits of the memory region we are trying
         // to read from.
-        println!("read...1");
-        println!("From {:#x} to {:#x}", addr.0, addr.0.checked_add(buf.len()).unwrap());
-        println!("Perms len {:#x} ", self.permissions.len());
         let perms = self
             .permissions
-            .get(addr.0..addr.0.checked_add(buf.len()).unwrap()).unwrap();
+            .get(addr.0..addr.0.checked_add(buf.len()).unwrap())
+            .unwrap();
 
         let mut has_raw = false;
         // Check memory region has READ bit set.
-        if expected_permissions.0 != 0 && !perms.iter().all(|x| (x.0 & expected_permissions.0) == expected_permissions.0) {
-        println!("read...2");
+        if expected_permissions.0 != 0
+            && !perms.iter().all(|x| {
+                (x.0 & expected_permissions.0) == expected_permissions.0
+            })
+        {
             return None;
         }
 
         buf.copy_from_slice(
-            self.memory.get(addr.0..addr.0.checked_add(buf.len()).unwrap()).unwrap(),
+            self.memory
+                .get(addr.0..addr.0.checked_add(buf.len()).unwrap())
+                .unwrap(),
         );
-        println!("read...done");
         Some(())
     }
 
@@ -388,33 +395,41 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "until we setup proper toolchain"]
+    #[ignore = "this test is environment specific and depends on built binary"]
     fn can_load_elf_binaries() {
         let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
-        let path = Path::new(&env_var).join("support/unit/rv64ui-p-add");
+        let path = Path::new(&env_var).join("support/unit/test_app");
 
-        let mut mmu = Mmu::new(4096 * 1024 * 1024);
+        let mut mmu = Mmu::new(32 * 1024 * 1024);
         mmu.load(
             path,
             &[
                 Section {
-                    file_offset: 0x0000000000001000,
-                    virt_addr: VirtAddr(0x0000000080000000),
-                    file_size: 0x00000000000006bc,
-                    mem_size: 0x00000000000006bc,
+                    file_offset: 0x0000000000000000,
+                    virt_addr: VirtAddr(0x0000000000010000),
+                    file_size: 0x0000000000000190,
+                    mem_size: 0x0000000000000190,
+                    permissions: Permission(PERM_READ),
+                },
+                Section {
+                    file_offset: 0x0000000000000190,
+                    virt_addr: VirtAddr(0x0000000000011190),
+                    file_size: 0x0000000000002598,
+                    mem_size: 0x0000000000002598,
                     permissions: Permission(PERM_EXEC),
                 },
                 Section {
-                    file_offset: 0x0000000000002000,
-                    virt_addr: VirtAddr(0x0000000080000000),
-                    file_size: 0x0000000000000048,
-                    mem_size: 0x0000000000000048,
-                    permissions: Permission(PERM_WRITE),
+                    file_offset: 0x0000000000002728,
+                    virt_addr: VirtAddr(0x0000000000014728),
+                    file_size: 0x00000000000000f8,
+                    mem_size: 0x0000000000000750,
+                    permissions: Permission(PERM_READ | PERM_WRITE),
                 },
             ],
         );
-        let mut buf = [0u8;4];
-        mmu.read_into_perms(VirtAddr(0x80000000), &mut buf, Permission(0)).unwrap();
-        println!("First 4 bytes {:#02x?}", buf);
+        let mut buf = [0u8; 4];
+        mmu.read_into_perms(VirtAddr(0x11190), &mut buf, Permission(0))
+            .unwrap();
+        assert_eq!(buf.as_slice(), vec![0x97, 0x41, 0x0, 0x0]);
     }
 }
