@@ -1,6 +1,6 @@
 //! 64-bit RISC-V RV64i emulator.
-use crate::mmu::Mmu;
-
+use crate::machine::Register;
+use crate::mmu::{Mmu, Permission, VirtAddr, DEFAULT_EMU_MMU_SIZE, PERM_EXEC};
 /// RISC-V 64-bit has 33 64-bit wide registers.
 const MAX_CPU_REGISTERS: usize = 33;
 
@@ -13,42 +13,51 @@ pub struct Emulator {
     registers: [u64; MAX_CPU_REGISTERS],
 }
 
-/// 64-bit RISC-V registers.
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
-#[repr(usize)]
-pub enum Register {
-    // Zero register always holds 0.
-    Zero = 0,
-    Ra,
-    Sp,
-    Gp,
-    Tp,
-    T0,
-    T1,
-    T2,
-    S0,
-    S1,
-    A0,
-    A1,
-    A2,
-    A3,
-    A4,
-    A5,
-    A6,
-    A7,
-    S2,
-    S3,
-    S4,
-    S5,
-    S6,
-    S7,
-    S8,
-    S9,
-    S10,
-    S11,
-    T3,
-    T4,
-    T5,
-    T6,
-    Pc,
+impl Emulator {
+    /// Create a new `Emulator` with an mmu of default size (32 MB).
+    pub fn new() -> Self {
+        Self {
+            memory: Mmu::new(DEFAULT_EMU_MMU_SIZE),
+            registers: [0u64; MAX_CPU_REGISTERS],
+        }
+    }
+
+    /// Reset emulator to its original state.
+    pub fn reset(&mut self, other: &Self) {
+        self.memory.reset(&other.memory);
+        self.registers = other.registers;
+    }
+
+    /// Read a register.
+    pub fn reg(&self, register: Register) -> u64 {
+        self.registers[register as usize]
+    }
+
+    /// Set a register to `value`.
+    pub fn set_reg(&mut self, register: Register, value: u64) {
+        self.registers[register as usize] = value
+    }
+
+    /// Run the emulator loop.
+    pub fn run(&mut self) -> Option<()> {
+        loop {
+            // Get current Pc.
+            let pc = self.reg(Register::Pc);
+            // Fetch next instruction.
+            let inst = self
+                .memory
+                .read_into::<u32>(VirtAddr(pc as usize), Permission(PERM_EXEC))
+                .expect("Failed to fetch next instruction");
+
+            // Decode instruction.
+            let opcode = inst & 0b1111111;
+
+            match opcode {
+                0b0110111 => {
+                    // LUI.
+                }
+                _ => todo!(),
+            }
+        }
+    }
 }

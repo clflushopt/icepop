@@ -1,5 +1,9 @@
 //! Software based memory management for Icepop.
+use crate::elf;
 use std::path::Path;
+
+/// Default MMU size when used in emulator.
+pub const DEFAULT_EMU_MMU_SIZE: usize = 32 * 1024 * 1024;
 
 /// Permission bytes are assigned to single bytes and define the permissions
 /// on a that byte.
@@ -178,26 +182,45 @@ impl Mmu {
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf`.
     pub fn read(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
-        // Fetch permission bits of the memory region we are trying
-        // to read from.
-        /*
-         let perms = self
-             .permissions
-             .get(addr.0..addr.0.checked_add(buf.len())?)?;
-
-         let mut has_raw = false;
-         // Check memory region has READ bit set.
-         if !perms.iter().all(|x| (x.0 & PERM_READ) != 0) {
-             return None;
-         }
-
-         buf.copy_from_slice(
-             self.memory.get(addr.0..addr.0.checked_add(buf.len())?)?,
-         );
-         Some(())
-        e*/
-
         self.read_into_perms(addr, buf, Permission(PERM_READ))
+    }
+
+    /// Read a type `T` at `addr` expecting the region `[addr..addr+sizeof(T)]`
+    /// to have the expected permissions.
+    pub fn read_into<T: Sized>(
+        &mut self,
+        addr: VirtAddr,
+        expected_permissions: Permission,
+    ) -> Option<T> {
+        // We will read at most an 8 byte chunk.
+        let mut buf = [0u8; 8];
+        println!(
+            "Reading {:} bytes for @ {:#0x}",
+            core::mem::size_of::<T>(),
+            addr.0,
+        );
+        self.read_into_perms(
+            addr,
+            &mut buf[..core::mem::size_of::<T>()],
+            expected_permissions,
+        )?;
+        Some(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+    }
+
+    /// Write a type `T` to `addr`.
+    pub fn write_into<T: Sized>(
+        &mut self,
+        addr: VirtAddr,
+        value: T,
+    ) -> Option<()> {
+        let buf = unsafe {
+            core::slice::from_raw_parts(
+                &value as *const T as *const u8,
+                core::mem::size_of::<T>(),
+            )
+        };
+
+        self.write(addr, buf)
     }
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf`.
@@ -236,7 +259,7 @@ impl Mmu {
     pub fn load<P: AsRef<Path>>(
         &mut self,
         filename: P,
-        sections: &[Section],
+        sections: &[elf::Section],
     ) -> Option<()> {
         // Read the file into memory.
         let contents = std::fs::read(filename).ok()?;
@@ -284,15 +307,6 @@ impl Mmu {
 
         Some(())
     }
-}
-
-/// Section information for ELF file format.
-pub struct Section {
-    pub file_offset: usize,
-    pub virt_addr: VirtAddr,
-    pub file_size: usize,
-    pub mem_size: usize,
-    pub permissions: Permission,
 }
 
 #[cfg(test)]
@@ -397,6 +411,8 @@ mod tests {
     #[test]
     #[ignore = "this test is environment specific and depends on built binary"]
     fn can_load_elf_binaries() {
+        use crate::elf;
+
         let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
         let path = Path::new(&env_var).join("support/unit/test_app");
 
@@ -404,21 +420,21 @@ mod tests {
         mmu.load(
             path,
             &[
-                Section {
+                elf::Section {
                     file_offset: 0x0000000000000000,
                     virt_addr: VirtAddr(0x0000000000010000),
                     file_size: 0x0000000000000190,
                     mem_size: 0x0000000000000190,
                     permissions: Permission(PERM_READ),
                 },
-                Section {
+                elf::Section {
                     file_offset: 0x0000000000000190,
                     virt_addr: VirtAddr(0x0000000000011190),
                     file_size: 0x0000000000002598,
                     mem_size: 0x0000000000002598,
                     permissions: Permission(PERM_EXEC),
                 },
-                Section {
+                elf::Section {
                     file_offset: 0x0000000000002728,
                     virt_addr: VirtAddr(0x0000000000014728),
                     file_size: 0x00000000000000f8,
