@@ -1,5 +1,8 @@
 //! RISC-V instruction decoder.
 
+/// RISC-V 64-bit has 33 64-bit wide registers.
+pub const MAX_CPU_REGISTERS: usize = 33;
+
 /// 64-bit RISC-V registers.
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 #[repr(usize)]
@@ -41,6 +44,14 @@ pub enum Register {
 }
 
 impl From<u8> for Register {
+    /// Transform a `u8` to `Register`, this cast is useful when parsing
+    /// instructions that encoded source and destination registers.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that value is within the specified range [0..32]
+    /// otherwise the assertion will fail.
+    /// Since we use `#[repr(usize)]` the pointer cast is safe.
     fn from(value: u8) -> Self {
         assert!(value < 32);
         unsafe {

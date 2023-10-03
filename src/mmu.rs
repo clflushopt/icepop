@@ -187,18 +187,18 @@ impl Mmu {
 
     /// Read a type `T` at `addr` expecting the region `[addr..addr+sizeof(T)]`
     /// to have the expected permissions.
+    ///
+    /// # Safety
+    ///
+    /// The largest sized type fits within the 16 bytes we allocate in `buf`
+    /// so the read will always be bounded.
     pub fn read_into<T: Sized>(
         &mut self,
         addr: VirtAddr,
         expected_permissions: Permission,
     ) -> Option<T> {
         // We will read at most an 8 byte chunk.
-        let mut buf = [0u8; 8];
-        println!(
-            "Reading {:} bytes for @ {:#0x}",
-            core::mem::size_of::<T>(),
-            addr.0,
-        );
+        let mut buf = [0u8; 16];
         self.read_into_perms(
             addr,
             &mut buf[..core::mem::size_of::<T>()],
@@ -208,6 +208,11 @@ impl Mmu {
     }
 
     /// Write a type `T` to `addr`.
+    ///
+    /// # Safety
+    ///
+    /// The `Sized` bound ensures that pointer has the size we are trying
+    /// to read.
     pub fn write_into<T: Sized>(
         &mut self,
         addr: VirtAddr,

@@ -1,8 +1,6 @@
 //! 64-bit RISC-V RV64i emulator.
-use crate::machine::Register;
+use crate::machine::{Register, MAX_CPU_REGISTERS};
 use crate::mmu::{Mmu, Permission, VirtAddr, DEFAULT_EMU_MMU_SIZE, PERM_EXEC};
-/// RISC-V 64-bit has 33 64-bit wide registers.
-const MAX_CPU_REGISTERS: usize = 33;
 
 /// Single threaded RISC-V RV64i emulator with an MMU.
 pub struct Emulator {
