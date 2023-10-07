@@ -1,9 +1,29 @@
 //! Software based memory management for Icepop.
+//!
+//! This is a translation-less software MMU that works with our local toolchain
+//! to change the code to support address translation you will need to change
+//! all `read` and `write` implementations to translate addresses.
+//!
+/// Address translation in soft MMU :
+///
+/// To do address translation on larger address ranges for example 0x8000_0000
+/// we can mark 0x8000_0000 as the base address and use relative addressing
+/// to translate all memory addresses, for example a load @ 0x8000_abcd in an
+/// MMU with a max addressable memory at 0x2000000 will be equivalent to :
+///
+/// new_address = base - addr
+/// new_address = 0x8000_0000 - 0x8000_abcd = 0xabcd
+///
+/// Which fits within our MMU's range.
+///
+/// Since the Toolchain we have builds all binaries with a base address or
+/// entry point of 0x10000 then we don't need to do the translation.
 use crate::elf;
 use std::path::Path;
 
 /// Default MMU size when used in emulator.
 pub const DEFAULT_EMU_MMU_SIZE: usize = 32 * 1024 * 1024;
+
 
 /// Permission bytes are assigned to single bytes and define the permissions
 /// on a that byte.
@@ -87,8 +107,7 @@ impl Mmu {
             // Restore permissions.
             self.permissions[start..end]
                 .copy_from_slice(&other.permissions[start..end]);
-        }
-
+         :
         // Clear the dirty blocks list.
         self.dirty.clear()
     }

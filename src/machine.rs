@@ -49,7 +49,7 @@ impl From<u8> for Register {
     ///
     /// # Safety
     ///
-    /// Caller must ensure that value is within the specified range [0..32]
+    /// Caller must ensure that value is within the specified range [0..32)
     /// otherwise the assertion will fail.
     /// Since we use `#[repr(usize)]` the pointer cast is safe.
     fn from(value: u8) -> Self {
