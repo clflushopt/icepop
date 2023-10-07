@@ -27,19 +27,21 @@ pub const DEFAULT_EMU_MMU_SIZE: usize = 32 * 1024 * 1024;
 /// Default MMU base when used with address translation.
 pub const DEFAULT_EMU_MMU_BASE: usize = 0x80000000;
 
-
 /// Permission bytes are assigned to single bytes and define the permissions
 /// on a that byte.
 #[repr(transparent)]
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Permission(pub u8);
 
-/// Permission bits that can be set on allocated memory, we have READ, WRITE
-/// and EXEC permissions and READ-AFTER-WRITE which can be used to track
-/// reading uninitialized memory.
+/// Permission bits that can be set on allocated memory
+///
+/// Read permissions.
 pub const PERM_READ: u8 = 1 << 0;
+/// Write permissions.
 pub const PERM_WRITE: u8 = 1 << 1;
+/// Execute permissions.
 pub const PERM_EXEC: u8 = 1 << 2;
+/// Read after write permissions.
 pub const PERM_RAW: u8 = 1 << 3;
 
 /// Unit number of bytes that are cleared and reset on each run.
@@ -110,7 +112,7 @@ impl Mmu {
             // Restore permissions.
             self.permissions[start..end]
                 .copy_from_slice(&other.permissions[start..end]);
-         }
+        }
         // Clear the dirty blocks list.
         self.dirty.clear()
     }
@@ -261,7 +263,10 @@ impl Mmu {
         // to read from.
         let perms = self
             .permissions
-            .get(self.translate(addr).0..self.translate(addr).0.checked_add(buf.len()).unwrap())
+            .get(
+                self.translate(addr).0
+                    ..self.translate(addr).0.checked_add(buf.len()).unwrap(),
+            )
             .unwrap();
 
         // Check memory region has READ bit set.
@@ -275,7 +280,14 @@ impl Mmu {
 
         buf.copy_from_slice(
             self.memory
-                .get(self.translate(addr).0..self.translate(addr).0.checked_add(buf.len()).unwrap())
+                .get(
+                    self.translate(addr).0
+                        ..self
+                            .translate(addr)
+                            .0
+                            .checked_add(buf.len())
+                            .unwrap(),
+                )
                 .unwrap(),
         );
         Some(())
@@ -511,8 +523,12 @@ mod tests {
             ],
         );
         let mut buf = [0u8; 4];
-        mmu.read_into_perms(VirtAddr(0x0000000080000000), &mut buf, Permission(0))
-            .unwrap();
+        mmu.read_into_perms(
+            VirtAddr(0x0000000080000000),
+            &mut buf,
+            Permission(0),
+        )
+        .unwrap();
         assert_eq!(buf.as_slice(), vec![0x6f, 0x0, 0x0, 0x5]);
     }
 }
