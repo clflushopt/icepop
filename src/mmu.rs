@@ -24,6 +24,9 @@ use std::path::Path;
 /// Default MMU size when used in emulator.
 pub const DEFAULT_EMU_MMU_SIZE: usize = 32 * 1024 * 1024;
 
+/// Default MMU base when used with address translation.
+pub const DEFAULT_EMU_MMU_BASE: usize = 0x80000000;
+
 
 /// Permission bytes are assigned to single bytes and define the permissions
 /// on a that byte.
@@ -107,7 +110,7 @@ impl Mmu {
             // Restore permissions.
             self.permissions[start..end]
                 .copy_from_slice(&other.permissions[start..end]);
-         :
+         }
         // Clear the dirty blocks list.
         self.dirty.clear()
     }
@@ -219,7 +222,7 @@ impl Mmu {
         // We will read at most an 8 byte chunk.
         let mut buf = [0u8; 16];
         self.read_into_perms(
-            addr,
+            self.translate(addr),
             &mut buf[..core::mem::size_of::<T>()],
             expected_permissions,
         )?;
@@ -258,10 +261,9 @@ impl Mmu {
         // to read from.
         let perms = self
             .permissions
-            .get(addr.0..addr.0.checked_add(buf.len()).unwrap())
+            .get(self.translate(addr).0..self.translate(addr).0.checked_add(buf.len()).unwrap())
             .unwrap();
 
-        let mut has_raw = false;
         // Check memory region has READ bit set.
         if expected_permissions.0 != 0
             && !perms.iter().all(|x| {
@@ -273,10 +275,18 @@ impl Mmu {
 
         buf.copy_from_slice(
             self.memory
-                .get(addr.0..addr.0.checked_add(buf.len()).unwrap())
+                .get(self.translate(addr).0..self.translate(addr).0.checked_add(buf.len()).unwrap())
                 .unwrap(),
         );
         Some(())
+    }
+
+    /// Translate a vitual address to its base relative offset.
+    fn translate(&self, addr: VirtAddr) -> VirtAddr {
+        if addr.0 >= DEFAULT_EMU_MMU_BASE {
+            return VirtAddr(addr.0 - DEFAULT_EMU_MMU_BASE);
+        }
+        addr
     }
 
     /// Load an ELF binary from disk.
@@ -292,14 +302,14 @@ impl Mmu {
         for section in sections {
             // Set memory to writable.
             self.set_permissions(
-                section.virt_addr,
+                self.translate(section.virt_addr),
                 section.mem_size,
                 Permission(PERM_WRITE),
             )?;
 
             // Write the binary to memory.
             self.write(
-                section.virt_addr,
+                self.translate(section.virt_addr),
                 contents.get(
                     section.file_offset
                         ..section.file_offset.checked_add(section.file_size)?,
@@ -310,15 +320,15 @@ impl Mmu {
             if section.mem_size > section.file_size {
                 let padding = vec![0u8; section.mem_size - section.file_size];
                 self.write(
-                    VirtAddr(
+                    self.translate(VirtAddr(
                         section.virt_addr.0.checked_add(section.file_size)?,
-                    ),
+                    )),
                     &padding,
                 )?;
             }
 
             self.set_permissions(
-                section.virt_addr,
+                self.translate(section.virt_addr),
                 section.mem_size,
                 section.permissions,
             )?;
@@ -471,5 +481,38 @@ mod tests {
         mmu.read_into_perms(VirtAddr(0x11190), &mut buf, Permission(0))
             .unwrap();
         assert_eq!(buf.as_slice(), vec![0x97, 0x41, 0x0, 0x0]);
+    }
+
+    #[test]
+    fn can_load_riscv_test_suite_binaries() {
+        use crate::elf;
+
+        let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
+        let path = Path::new(&env_var).join("support/unit/rv64ui-p-add");
+
+        let mut mmu = Mmu::new(32 * 1024 * 1024);
+        mmu.load(
+            path,
+            &[
+                elf::Section {
+                    file_offset: 0x0000000000001000,
+                    virt_addr: VirtAddr(0x0000000080000000),
+                    file_size: 0x0006bc,
+                    mem_size: 0x0006bc,
+                    permissions: Permission(PERM_READ | PERM_EXEC),
+                },
+                elf::Section {
+                    file_offset: 0x0000000000002000,
+                    virt_addr: VirtAddr(0x0000000080001000),
+                    file_size: 0x000048,
+                    mem_size: 0x000048,
+                    permissions: Permission(PERM_READ | PERM_WRITE),
+                },
+            ],
+        );
+        let mut buf = [0u8; 4];
+        mmu.read_into_perms(VirtAddr(0x0000000080000000), &mut buf, Permission(0))
+            .unwrap();
+        assert_eq!(buf.as_slice(), vec![0x6f, 0x0, 0x0, 0x5]);
     }
 }
