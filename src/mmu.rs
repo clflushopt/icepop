@@ -500,7 +500,7 @@ mod tests {
         use crate::elf;
 
         let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
-        let path = Path::new(&env_var).join("support/unit/rv64ui-p-add");
+        let path = Path::new(&env_var).join("support/compliance/rv64ui-p-add");
 
         let mut mmu = Mmu::new(32 * 1024 * 1024);
         mmu.load(
