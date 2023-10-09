@@ -252,7 +252,37 @@ impl Mmu {
         self.write(addr, buf)
     }
 
-    /// Read `buf.len()` bytes from `memory` at `addr` into `buf`.
+    /// Return an immutable view of memory @ `addr`.
+    pub fn peek_perms(
+        &self,
+        addr: VirtAddr,
+        size: usize,
+        expected_permissions: Permission,
+    ) -> Option<&[u8]> {
+        // Fetch permission bits of the memory region we are trying
+        // to read from.
+        let perms = self.permissions.get(
+            self.translate(addr).0
+                ..self.translate(addr).0.checked_add(size).unwrap(),
+        )?;
+
+        // Check memory region has READ bit set.
+        if expected_permissions.0 != 0
+            && !perms.iter().all(|x| {
+                (x.0 & expected_permissions.0) == expected_permissions.0
+            })
+        {
+            return None;
+        }
+
+        self.memory.get(
+            self.translate(addr).0
+                ..self.translate(addr).0.checked_add(size).unwrap(),
+        )
+    }
+
+    /// Read `buf.len()` bytes from `memory` at `addr` into `buf` assuming
+    /// permission checks pass.
     pub fn read_into_perms(
         &self,
         addr: VirtAddr,

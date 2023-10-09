@@ -1,4 +1,4 @@
-//! RISC-V instruction decoder.
+//! RISC-V instruction decoder and machine specification.
 
 /// RISC-V 64-bit has 33 64-bit wide registers.
 pub const MAX_CPU_REGISTERS: usize = 33;
