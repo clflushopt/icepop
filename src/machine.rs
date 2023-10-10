@@ -62,6 +62,77 @@ impl From<u32> for Register {
     }
 }
 
+/// Control and Satus Registers.
+///
+/// Machine and supervisor level CSRs
+#[derive(Debug, Copy, Clone, PartialEq)]
+#[repr(usize)]
+pub enum Csr {
+    // Hardware thread identifier.
+    MHartID = 0xf14,
+    // Machine Status register.
+    MStatus = 0x300,
+    // Exception delegation register.
+    MEDeleg = 0x302,
+    // Interrupt delegation register.
+    MIDeleg = 0x303,
+    // Interrupt-enable register.
+    MIE = 0x304,
+    // Trap handler base address.
+    MTVec = 0x305,
+    // Enable machine counter.
+    MCounterEn = 0x306,
+    // Scratch register for trap handlers.
+    MScratch = 0x340,
+    // Exception program counter.
+    MEPc = 0x341,
+    // Trap cause.
+    MCause = 0x342,
+    // Bad address or illegal instruction.
+    MTVal = 0x343,
+    // Interrupt pending.
+    MIP = 0x344,
+
+    // Supervisor status register.
+    SStatus = 0x100,
+    // Supervisor interrupt enable register.
+    SIE = 0x104,
+    // Supervisor trap handler address.
+    STVec = 0x105,
+    // Scratch register for supervisor trap handlers.
+    SScratch = 0x140,
+    // Supervisor exception program counter.
+    SEPC = 0x141,
+    // Supervisor trap cause.
+    SCause = 0x142,
+    // Supervisor bad address or illegal instruction.
+    STVal = 0x143,
+    // Supervisor interrupt pending.
+    SIP = 0x144,
+    // Supervisor address translation and protection.
+    SATP = 0x180,
+}
+
+impl From<usize> for Csr {
+    /// Transforms a `usize` to `Csr`, this cast is useful when parsing
+    /// the immediate that encodes the Csr value that we want.
+    ///
+    /// # Safety
+    ///
+    /// Caller must ensure that value is within the specified range [0..4096)
+    /// otherwise the assertion will fail.
+    /// Since we use `#[repr(usize)]` the pointer cast is safe.
+    fn from(value: usize) -> Self {
+        println!("Got value for Csr : {value}");
+        assert!(value < 4096);
+        unsafe {
+            core::ptr::read_unaligned(
+                &(value as usize) as *const usize as *const Csr,
+            )
+        }
+    }
+}
+
 /// U-type instruction.
 #[derive(Debug, Clone, Copy)]
 pub struct Utype {

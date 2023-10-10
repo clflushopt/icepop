@@ -1,6 +1,6 @@
 //! 64-bit RISC-V RV64i emulator.
 use crate::machine::{
-    Btype, Itype, Jtype, Register, Rtype, Stype, Utype, MAX_CPU_REGISTERS,
+    Btype, Csr, Itype, Jtype, Register, Rtype, Stype, Utype, MAX_CPU_REGISTERS,
 };
 use crate::mmu::{
     Mmu, Permission, VirtAddr, DEFAULT_EMU_MMU_SIZE, PERM_EXEC, PERM_READ,
@@ -13,6 +13,9 @@ pub struct Emulator {
 
     /// RV64i register state.
     registers: [u64; MAX_CPU_REGISTERS],
+
+    /// Control and status Register.
+    csrs: [u64; 4096],
 
     /// Execution mode, supports `ExecMode::Debug`.
     mode: ExecMode,
@@ -37,10 +40,17 @@ pub enum VmExit {
     Exit,
     /// VM exit due to an unhandled syscall.
     Syscall,
-    /// VM exit due an integer overflow.
+    /// VM exit due an integer overflow in a syscall argument.
     SyscallIntegerOverflow,
-    /// VM exit due to a read fault @ `VirtAddr` of `usize` length.
-    ReadFault(VirtAddr, usize),
+    /// VM exit due to an out of bounds read or write that overflowed
+    /// the address.
+    OutOfBounds,
+    /// VM exit due to a read fault caused by missing permissions.
+    ReadFault(VirtAddr),
+    /// VM exit due to a write fault caused by missing permissions.
+    WriteFault(VirtAddr),
+    /// VM exit due to an out of bounds address.
+    AddressFault(VirtAddr, usize),
 }
 
 impl Emulator {
@@ -49,6 +59,7 @@ impl Emulator {
         Self {
             memory: Mmu::new(DEFAULT_EMU_MMU_SIZE),
             registers: [0u64; MAX_CPU_REGISTERS],
+            csrs: [0u64; 4096],
             mode: ExecMode::Debug,
         }
     }
@@ -115,6 +126,26 @@ impl Emulator {
         }
     }
 
+    /// Read a control and status register.
+    pub fn csr(&self, register: Csr) -> u64 {
+        if register != Csr::SIE {
+            self.csrs[register as usize]
+        } else {
+            self.csrs[Csr::MIE as usize] & self.csrs[Csr::MIDeleg as usize]
+        }
+    }
+
+    /// Set a control and status register.
+    pub fn set_csr(&mut self, register: Csr, value: u64) {
+        if register != Csr::SIE {
+            self.csrs[register as usize] = value
+        } else {
+            self.csrs[Csr::MIE as usize] = (self.csrs[Csr::MIE as usize]
+                & !self.csrs[Csr::MIDeleg as usize])
+                | (value & self.csrs[Csr::MIDeleg as usize]);
+        }
+    }
+
     /// Handle system calls.
     pub fn handle_syscall(&mut self, syscall: u64) -> Result<(), VmExit> {
         match syscall {
@@ -142,18 +173,17 @@ impl Emulator {
                     // Read the iovec entry pointer and length.
                     let buf: usize = self
                         .memory
-                        .read_into(VirtAddr(ptr + 0), Permission(PERM_READ))
-                        .ok_or(VmExit::ReadFault(VirtAddr(ptr + 0), 8))?;
+                        .read_into(VirtAddr(ptr + 0), Permission(PERM_READ))?;
                     let len: usize = self
                         .memory
-                        .read_into(VirtAddr(ptr + 8), Permission(PERM_READ))
-                        .ok_or(VmExit::ReadFault(VirtAddr(ptr + 8), 8))?;
+                        .read_into(VirtAddr(ptr + 8), Permission(PERM_READ))?;
 
                     // Read the iovec buffer.
-                    let _data = self
-                        .memory
-                        .peek_perms(VirtAddr(buf), len, Permission(PERM_READ))
-                        .ok_or(VmExit::ReadFault(VirtAddr(buf), len))?;
+                    let _data = self.memory.peek_perms(
+                        VirtAddr(buf),
+                        len,
+                        Permission(PERM_READ),
+                    )?;
 
                     bytes_written += len as u64;
 
@@ -172,13 +202,13 @@ impl Emulator {
                 self.set_reg(Register::A0, 0x1337);
                 Ok(())
             }
-            94 => Err(VmExit::Exit),
+            93 | 94 => Err(VmExit::Exit),
             _ => panic!("Unhandled syscall {syscall}"),
         }
     }
 
     /// Run the emulator loop.
-    pub fn run(&mut self) -> Option<VmExit> {
+    pub fn run(&mut self) -> Result<(), VmExit> {
         'next_inst: loop {
             // Get current Pc.
             let pc = self.reg(Register::Pc);
@@ -572,12 +602,16 @@ impl Emulator {
                     }
                 }
                 0b1110011 => {
+                    let imm = ((inst & 0xfff00000) >> 20) as usize;
                     let inst = Itype::from(inst);
+                    let rs1 = inst.rs1;
+                    let rd = inst.rd;
+
                     match inst.funct3 {
                         0b000 => {
                             if inst.imm == 0b0 {
                                 // ECALL
-                                return Some(VmExit::Syscall);
+                                return Err(VmExit::Syscall);
                                 //panic!("Executing Syscall");
                             } else if inst.imm == 0b1 {
                                 // EBREAK
@@ -585,22 +619,47 @@ impl Emulator {
                             }
                         }
                         0b001 => {
-                            // CSRRW
+                            // CSRRW reads old value of CSR, zero-extends then
+                            // writes it to rd.
+                            //
+                            let old = self.csr(Csr::from(imm));
+                            self.set_csr(Csr::from(imm), self.reg(rs1));
+                            self.set_reg(rd, old);
                         }
                         0b010 => {
                             // CSRRS
+                            let old = self.csr(Csr::from(imm));
+                            self.set_csr(Csr::from(imm), old | self.reg(rs1));
+                            self.set_reg(rd, old);
                         }
                         0b011 => {
                             // CSRRC
+                            let old = self.csr(Csr::from(imm));
+                            self.set_csr(
+                                Csr::from(imm),
+                                old & (!self.reg(rs1)),
+                            );
+                            self.set_reg(rd, old);
                         }
                         0b101 => {
                             // CSRRWI
+                            let zimm = imm as u64;
+                            self.set_csr(Csr::from(imm), zimm);
+                            self.set_reg(rd, self.csr(Csr::from(imm)));
                         }
                         0b110 => {
                             // CSRRSI
+                            let zimm = imm as u64;
+                            let old = self.csr(Csr::from(imm));
+                            self.set_csr(Csr::from(imm), old | zimm);
+                            self.set_reg(rd, old);
                         }
                         0b111 => {
                             // CSRRCI
+                            let zimm = imm as u64;
+                            let old = self.csr(Csr::from(imm));
+                            self.set_csr(Csr::from(imm), old & (!zimm));
+                            self.set_reg(rd, old);
                         }
                         _ => todo!(),
                     }
@@ -764,6 +823,18 @@ mod tests {
 
         // Set program counter to our test app entry point.
         emu.set_reg(Register::Pc, test_app_entry_point);
-        emu.run().expect("Failed to run emulator loop");
+        let exit_reason = emu.run().expect_err("Failed to run emulator loop.");
+        match exit_reason {
+            // Handle syscalls.
+            VmExit::Syscall => {
+                let num = emu.reg(Register::A7);
+                if let Err(exit_reason) = emu.handle_syscall(num) {
+                    panic!("Handling syscall {num}");
+                }
+                let pc = emu.reg(Register::Pc);
+                emu.set_reg(Register::Pc, pc.wrapping_add(4));
+            }
+            _ => panic!("Unhandled exit reason : {:?}", exit_reason),
+        }
     }
 }

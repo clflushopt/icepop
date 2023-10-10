@@ -19,6 +19,7 @@
 /// Since the Toolchain we have builds all binaries with a base address or
 /// entry point of 0x10000 then we don't need to do the translation.
 use crate::elf;
+use crate::emu::VmExit;
 use std::path::Path;
 
 /// Default MMU size when used in emulator.
@@ -98,7 +99,7 @@ impl Mmu {
         }
     }
 
-    /// Restores MMU state to its original state.
+    /// Restores MMU to its original state.
     pub fn reset(&mut self, other: &Mmu) {
         for &block in &self.dirty {
             let start = block * DIRTY_BLOCK_SIZE;
@@ -137,6 +138,7 @@ impl Mmu {
             return None;
         }
 
+        // Set memory as Read & Write.
         self.set_permissions(base, size, Permission(PERM_RAW | PERM_WRITE));
 
         Some(base)
@@ -158,22 +160,28 @@ impl Mmu {
     }
 
     /// Write the bytes from `buf` into `memory` at given `addr`.
-    pub fn write(&mut self, addr: VirtAddr, buf: &[u8]) -> Option<()> {
+    pub fn write(&mut self, addr: VirtAddr, buf: &[u8]) -> Result<(), VmExit> {
         let perms = self
             .permissions
-            .get_mut(addr.0..addr.0.checked_add(buf.len())?)?;
+            .get_mut(
+                addr.0
+                    ..addr
+                        .0
+                        .checked_add(buf.len())
+                        .ok_or(VmExit::OutOfBounds)?,
+            )
+            .ok_or(VmExit::AddressFault(addr, buf.len()))?;
         // Check that the entire memory region [addr..addr+buf.len()]
         // is writable.
         let mut has_raw = false;
-        if !perms.iter().all(|x| {
-            has_raw |= (x.0 & PERM_RAW) != 0;
-            (x.0 & PERM_WRITE) != 0
-        }) {
-            return None;
+        for (idx, &perm) in perms.iter().enumerate() {
+            has_raw |= (perm.0 & PERM_RAW) != 0;
+            if (perm.0 & PERM_WRITE) == 0 {
+                return Err(VmExit::WriteFault(VirtAddr(addr.0 + idx)));
+            }
         }
 
-        self.memory
-            .get_mut(addr.0..addr.0.checked_add(buf.len())?)?
+        self.memory[Mmu::translate(addr).0..Mmu::translate(addr).0 + buf.len()]
             .copy_from_slice(buf);
 
         // Compute dirty bit blocks.
@@ -201,11 +209,11 @@ impl Mmu {
                 }
             });
         }
-        Some(())
+        Ok(())
     }
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf`.
-    pub fn read(&self, addr: VirtAddr, buf: &mut [u8]) -> Option<()> {
+    pub fn read(&self, addr: VirtAddr, buf: &mut [u8]) -> Result<(), VmExit> {
         self.read_into_perms(addr, buf, Permission(PERM_READ))
     }
 
@@ -220,15 +228,15 @@ impl Mmu {
         &mut self,
         addr: VirtAddr,
         expected_permissions: Permission,
-    ) -> Option<T> {
+    ) -> Result<T, VmExit> {
         // We will read at most an 8 byte chunk.
         let mut buf = [0u8; 16];
         self.read_into_perms(
-            self.translate(addr),
+            Mmu::translate(addr),
             &mut buf[..core::mem::size_of::<T>()],
             expected_permissions,
         )?;
-        Some(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
     }
 
     /// Write a type `T` to `addr`.
@@ -241,7 +249,7 @@ impl Mmu {
         &mut self,
         addr: VirtAddr,
         value: T,
-    ) -> Option<()> {
+    ) -> Result<(), VmExit> {
         let buf = unsafe {
             core::slice::from_raw_parts(
                 &value as *const T as *const u8,
@@ -258,27 +266,28 @@ impl Mmu {
         addr: VirtAddr,
         size: usize,
         expected_permissions: Permission,
-    ) -> Option<&[u8]> {
+    ) -> Result<&[u8], VmExit> {
         // Fetch permission bits of the memory region we are trying
         // to read from.
-        let perms = self.permissions.get(
-            self.translate(addr).0
-                ..self.translate(addr).0.checked_add(size).unwrap(),
-        )?;
+        let perms = self
+            .permissions
+            .get(
+                Mmu::translate(addr).0
+                    ..Mmu::translate(addr)
+                        .0
+                        .checked_add(size)
+                        .ok_or(VmExit::OutOfBounds)?,
+            )
+            .ok_or(VmExit::AddressFault(addr, size))?;
 
         // Check memory region has READ bit set.
-        if expected_permissions.0 != 0
-            && !perms.iter().all(|x| {
-                (x.0 & expected_permissions.0) == expected_permissions.0
-            })
-        {
-            return None;
+        for (idx, &perm) in perms.iter().enumerate() {
+            if (perm.0 & expected_permissions.0) != expected_permissions.0 {
+                return Err(VmExit::ReadFault(VirtAddr(addr.0 + idx)));
+            }
         }
 
-        self.memory.get(
-            self.translate(addr).0
-                ..self.translate(addr).0.checked_add(size).unwrap(),
-        )
+        Ok(&self.memory[Mmu::translate(addr).0..Mmu::translate(addr).0 + size])
     }
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf` assuming
@@ -288,43 +297,36 @@ impl Mmu {
         addr: VirtAddr,
         buf: &mut [u8],
         expected_permissions: Permission,
-    ) -> Option<()> {
+    ) -> Result<(), VmExit> {
         // Fetch permission bits of the memory region we are trying
         // to read from.
         let perms = self
             .permissions
             .get(
-                self.translate(addr).0
-                    ..self.translate(addr).0.checked_add(buf.len()).unwrap(),
+                Mmu::translate(addr).0
+                    ..Mmu::translate(addr)
+                        .0
+                        .checked_add(buf.len())
+                        .ok_or(VmExit::OutOfBounds)?,
             )
-            .unwrap();
+            .ok_or(VmExit::AddressFault(addr, buf.len()))?;
 
         // Check memory region has READ bit set.
-        if expected_permissions.0 != 0
-            && !perms.iter().all(|x| {
-                (x.0 & expected_permissions.0) == expected_permissions.0
-            })
-        {
-            return None;
+        for (idx, &perm) in perms.iter().enumerate() {
+            if (perm.0 & expected_permissions.0) != expected_permissions.0 {
+                return Err(VmExit::ReadFault(VirtAddr(addr.0 + idx)));
+            }
         }
 
         buf.copy_from_slice(
-            self.memory
-                .get(
-                    self.translate(addr).0
-                        ..self
-                            .translate(addr)
-                            .0
-                            .checked_add(buf.len())
-                            .unwrap(),
-                )
-                .unwrap(),
+            &self.memory
+                [Mmu::translate(addr).0..Mmu::translate(addr).0 + buf.len()],
         );
-        Some(())
+        Ok(())
     }
 
     /// Translate a vitual address to its base relative offset.
-    fn translate(&self, addr: VirtAddr) -> VirtAddr {
+    fn translate(addr: VirtAddr) -> VirtAddr {
         if addr.0 >= DEFAULT_EMU_MMU_BASE {
             return VirtAddr(addr.0 - DEFAULT_EMU_MMU_BASE);
         }
@@ -344,33 +346,35 @@ impl Mmu {
         for section in sections {
             // Set memory to writable.
             self.set_permissions(
-                self.translate(section.virt_addr),
+                Mmu::translate(section.virt_addr),
                 section.mem_size,
                 Permission(PERM_WRITE),
             )?;
 
             // Write the binary to memory.
             self.write(
-                self.translate(section.virt_addr),
+                Mmu::translate(section.virt_addr),
                 contents.get(
                     section.file_offset
                         ..section.file_offset.checked_add(section.file_size)?,
                 )?,
-            )?;
+            )
+            .ok()?;
 
             // Fill any padding with zeroes.
             if section.mem_size > section.file_size {
                 let padding = vec![0u8; section.mem_size - section.file_size];
                 self.write(
-                    self.translate(VirtAddr(
+                    Mmu::translate(VirtAddr(
                         section.virt_addr.0.checked_add(section.file_size)?,
                     )),
                     &padding,
-                )?;
+                )
+                .ok()?;
             }
 
             self.set_permissions(
-                self.translate(section.virt_addr),
+                Mmu::translate(section.virt_addr),
                 section.mem_size,
                 section.permissions,
             )?;
@@ -423,7 +427,7 @@ mod tests {
         // Only 21 bytes have been written, trying to read out of bounds
         // on the 11 bytes that aren't marked RAW will fail.
         let mut buf = [0u8; 32];
-        assert!(mmu.read(write_base_addr, &mut buf).is_none());
+        assert!(mmu.read(write_base_addr, &mut buf).is_err());
     }
 
     #[test]
@@ -433,7 +437,7 @@ mod tests {
         mmu.write(write_base_addr, b"cafe").unwrap();
         mmu.write(write_base_addr, b"cafe").unwrap();
         let mut buf = [0u8; 4];
-        assert!(mmu.read(write_base_addr, &mut buf).is_some());
+        assert!(mmu.read(write_base_addr, &mut buf).is_ok());
         // 0x10000 / 0x1000 = 0x10
         assert_eq!(mmu.dirty[0], 0x10);
     }
@@ -480,7 +484,7 @@ mod tests {
             forked.reset(&mmu);
             // Permissions are reset the read will fail.
             let mut buf = [0u8; 4];
-            assert!(forked.read(write_base_addr, &mut buf).is_none());
+            assert!(forked.read(write_base_addr, &mut buf).is_err());
         }
     }
 

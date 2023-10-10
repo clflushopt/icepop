@@ -7,14 +7,15 @@ fn main() {
     use std::env;
     use std::path::Path;
 
-    let mut emu = Emulator::new();
-    emu.prepare();
+    let mut vm = Emulator::new();
+    // Prepare the VM environment.
+    vm.prepare();
 
     let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
     let path = Path::new(&env_var).join("support/unit/test_app");
     let test_app_entry_point = 0x11190;
 
-    emu.memory
+    vm.memory
         .load(
             path,
             &[
@@ -48,24 +49,26 @@ fn main() {
         .expect("Failed to read test binary");
 
     // Set program counter to our test app entry point.
-    emu.set_reg(Register::Pc, test_app_entry_point);
+    vm.set_reg(Register::Pc, test_app_entry_point);
 
     // Disable debug logs.
-    emu.set_mode(ExecMode::Reset);
+    vm.set_mode(ExecMode::Reset);
     // VM run loop.
-    let vmexit = loop {
-        let vmexit = emu.run().expect("Failed to run emulator loop.");
-        match vmexit {
+    let exit_reason = loop {
+        let exit_reason = vm.run().expect_err("Failed to run emulator loop.");
+        match exit_reason {
+            // Handle syscalls.
             VmExit::Syscall => {
-                let num = emu.reg(Register::A7);
-                if let Err(vmexit) = emu.handle_syscall(num) {
-                    break vmexit;
+                let num = vm.reg(Register::A7);
+                if let Err(exit_reason) = vm.handle_syscall(num) {
+                    break exit_reason;
                 }
-                let pc = emu.reg(Register::Pc);
-                emu.set_reg(Register::Pc, pc.wrapping_add(4));
+                let pc = vm.reg(Register::Pc);
+                vm.set_reg(Register::Pc, pc.wrapping_add(4));
             }
-            _ => break vmexit,
+            // Exit the Vm if `exit_reason` is anythign other than `VmExit::Syscall`.
+            _ => break exit_reason,
         }
     };
-    println!("VM exited with {:#x?}", vmexit);
+    println!("VM exited with {:#x?}", exit_reason);
 }
