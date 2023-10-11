@@ -70,5 +70,5 @@ fn main() {
             _ => break exit_reason,
         }
     };
-    println!("VM exited with {:#x?}", exit_reason);
+    println!("VM exited with syscall: {:#x?}", exit_reason);
 }

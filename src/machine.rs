@@ -123,7 +123,6 @@ impl From<usize> for Csr {
     /// otherwise the assertion will fail.
     /// Since we use `#[repr(usize)]` the pointer cast is safe.
     fn from(value: usize) -> Self {
-        println!("Got value for Csr : {value}");
         assert!(value < 4096);
         unsafe {
             core::ptr::read_unaligned(

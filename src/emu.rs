@@ -202,7 +202,9 @@ impl Emulator {
                 self.set_reg(Register::A0, 0x1337);
                 Ok(())
             }
-            93 | 94 => Err(VmExit::Exit),
+            93 | 94 => {
+                Err(VmExit::Exit)
+            }
             _ => panic!("Unhandled syscall {syscall}"),
         }
     }
@@ -499,8 +501,15 @@ impl Emulator {
                         0b001 => {
                             // SLLI: Shift rs1 left by shift amount in imm
                             // and store in Rd.
-                            let shamt = inst.imm & 0b111111;
-                            self.set_reg(inst.rd, rs1 << shamt);
+                            let mode = (inst.imm >> 6) & 0b111111;
+
+                            match mode {
+                                0b000000 => {
+                                    let shamt = inst.imm & 0b111111;
+                                    self.set_reg(inst.rd, rs1 << shamt);
+                                }
+                                _ => unreachable!(),
+                            }
                         }
                         0b101 => {
                             // Uses the mode bits (last 6 bits) in the imm
@@ -676,7 +685,7 @@ impl Emulator {
                             // ADDIW: Add immediate to Rd.
                             self.set_reg(
                                 inst.rd,
-                                rs1.wrapping_add(imm) as i64 as u64,
+                                rs1.wrapping_add(imm) as i32 as i64 as u64,
                             );
                         }
                         0b001 => {
@@ -790,51 +799,73 @@ mod tests {
     use std::env;
     use std::path::Path;
 
-    #[test]
-    #[ignore = "this test is for compliance only and isn't properly handled"]
-    fn can_run_add_compliance_test() {
-        let mut emu = Emulator::new();
+    /// This macro builds a test case for a specific RISCV-64 UI binary.
+    /// All the test cases have the same structure after being linked and so
+    /// they share the same entrypoint 0x80000000 and file offsets of sections
+    /// we care about 0x1000 and 0x2000 respectively.
+    macro_rules! run_compliance_case {
+        ($name: ident, $file_name: expr) => {
+            #[test]
+            fn $name() {
+                let mut emu = Emulator::new();
+                let filename = $file_name;
+                let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
+                let path  = Path::new(&env_var).join(filename);
+                let test_app_entry_point = 0x80000000;
+                emu.set_mode(ExecMode::Reset);
 
-        let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
-        let path = Path::new(&env_var).join("support/compliance/rv64ui-p-add");
-        let test_app_entry_point = 0x80000000;
+                emu.memory
+                    .load(
+                        path,
+                        &[
+                            elf::Section {
+                                file_offset: 0x0000000000001000,
+                                virt_addr: mmu::VirtAddr(0x0000000080000000),
+                                file_size: 0x00000000000006bc,
+                                mem_size: 0x00000000000006bc,
+                                permissions: mmu::Permission(
+                                    PERM_READ | PERM_EXEC,
+                                ),
+                            },
+                            elf::Section {
+                                file_offset: 0x0000000000002000,
+                                virt_addr: mmu::VirtAddr(0x0000000080001000),
+                                file_size: 0x0000000000000048,
+                                mem_size: 0x0000000000000048,
+                                permissions: mmu::Permission(
+                                    PERM_READ | PERM_WRITE,
+                                ),
+                            },
+                        ],
+                    )
+                    .expect("Failed to read test binary");
 
-        emu.memory
-            .load(
-                path,
-                &[
-                    elf::Section {
-                        file_offset: 0x0000000000001000,
-                        virt_addr: mmu::VirtAddr(0x0000000080000000),
-                        file_size: 0x00000000000006bc,
-                        mem_size: 0x00000000000006bc,
-                        permissions: mmu::Permission(PERM_READ | PERM_EXEC),
-                    },
-                    elf::Section {
-                        file_offset: 0x0000000000002000,
-                        virt_addr: mmu::VirtAddr(0x0000000080001000),
-                        file_size: 0x0000000000000048,
-                        mem_size: 0x0000000000000048,
-                        permissions: mmu::Permission(PERM_READ | PERM_WRITE),
-                    },
-                ],
-            )
-            .expect("Failed to read test binary");
-
-        // Set program counter to our test app entry point.
-        emu.set_reg(Register::Pc, test_app_entry_point);
-        let exit_reason = emu.run().expect_err("Failed to run emulator loop.");
-        match exit_reason {
-            // Handle syscalls.
-            VmExit::Syscall => {
-                let num = emu.reg(Register::A7);
-                if let Err(exit_reason) = emu.handle_syscall(num) {
-                    panic!("Handling syscall {num}");
+                // Set program counter to our test app entry point.
+                emu.set_reg(Register::Pc, test_app_entry_point);
+                let exit_reason =
+                    emu.run().expect_err("Failed to run emulator loop.");
+                match exit_reason {
+                    // Handle , for the compliance tests exit
+                    // Compliance tests use an `exit` syscall with a status number `0`
+                    // for pass, the calling convention specifies that for syscalls
+                    // arguments go in `Register::A0` so to check if we pass a given
+                    // test we read the `Register::A0` and check if it's 0 otherwise
+                    // well the test failed.
+                    // ref: https://riscv.org/wp-content/uploads/2015/01/riscv-calling.pdf
+                    VmExit::Syscall => {
+                        let syscall_num = emu.reg(Register::A7);
+                        let exit_code = emu.reg(Register::A0);
+                        // Ensure that the syscall on exit is `exit` or `exit_group`
+                        // this is a sanity check for when we check the `exit_code`.
+                        assert!((syscall_num == 93) || (syscall_num == 94));
+                        assert_eq!(exit_code, 0);
+                    }
+                    _ => panic!("Unexpected exit reason : {:?}", exit_reason),
                 }
-                let pc = emu.reg(Register::Pc);
-                emu.set_reg(Register::Pc, pc.wrapping_add(4));
             }
-            _ => panic!("Unhandled exit reason : {:?}", exit_reason),
-        }
+        };
     }
+
+    run_compliance_case!(can_pass_compliance_test_rv64i_add, "support/compliance/rv64ui-p-add");
+    run_compliance_case!(can_pass_compliance_test_rv64i_sub, "support/compliance/rv64ui-p-sub");
 }

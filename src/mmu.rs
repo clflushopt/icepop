@@ -164,8 +164,8 @@ impl Mmu {
         let perms = self
             .permissions
             .get_mut(
-                addr.0
-                    ..addr
+                Mmu::translate(addr).0
+                    ..Mmu::translate(addr)
                         .0
                         .checked_add(buf.len())
                         .ok_or(VmExit::OutOfBounds)?,
