@@ -1,4 +1,5 @@
-//! 64-bit RISC-V RV64i emulator.
+//! 64-bit RISC-V emulator for the user mode base level ISA `RV64i` with
+//! support for memory hooks and just-in-time dynamic recompilation.
 use crate::machine::{
     Btype, Csr, Itype, Jtype, Register, Rtype, Stype, Utype, MAX_CPU_REGISTERS,
 };
@@ -19,6 +20,12 @@ pub struct Emulator {
 
     /// Execution mode, supports `ExecMode::Debug`.
     mode: ExecMode,
+
+    /// List of hooks to run before performing an IO operation.
+    pre: Vec<fn()>,
+
+    /// List of hooks to run after performing an IO operation.
+    post: Vec<fn()>,
 }
 
 /// Execution mode for the Emulator, note that `Debug` mode writes to `stdout`
@@ -41,7 +48,7 @@ pub enum VmExit {
     /// VM exit due to an unhandled syscall.
     Syscall,
     /// VM exit due an integer overflow in a syscall argument.
-    SyscallIntegerOverflow,
+    IntegerOverflow,
     /// VM exit due to an out of bounds read or write that overflowed
     /// the address.
     OutOfBounds,
@@ -61,6 +68,8 @@ impl Emulator {
             registers: [0u64; MAX_CPU_REGISTERS],
             csrs: [0u64; 4096],
             mode: ExecMode::Debug,
+            pre: vec![],
+            post: vec![],
         }
     }
 
@@ -70,6 +79,10 @@ impl Emulator {
     }
 
     /// Prepare the VM stack with respect to ABI.
+    ///
+    /// # Panics
+    ///
+    /// `prepare` panics if it is not able to allocate stack space.
     pub fn prepare(&mut self) {
         /// Macro for stack push.
         macro_rules! push {
@@ -166,7 +179,7 @@ impl Emulator {
                         .checked_mul(idx)
                         .and_then(|x| x.checked_add(iov))
                         .and_then(|x| x.checked_add(15))
-                        .ok_or(VmExit::SyscallIntegerOverflow)?
+                        .ok_or(VmExit::IntegerOverflow)?
                         as usize
                         - 15;
 
@@ -179,7 +192,7 @@ impl Emulator {
                         .read_into(VirtAddr(ptr + 8), Permission(PERM_READ))?;
 
                     // Read the iovec buffer.
-                    let _data = self.memory.peek_perms(
+                    let _data = self.memory.view(
                         VirtAddr(buf),
                         len,
                         Permission(PERM_READ),
@@ -202,9 +215,7 @@ impl Emulator {
                 self.set_reg(Register::A0, 0x1337);
                 Ok(())
             }
-            93 | 94 => {
-                Err(VmExit::Exit)
-            }
+            93 | 94 => Err(VmExit::Exit),
             _ => panic!("Unhandled syscall {syscall}"),
         }
     }
@@ -224,7 +235,7 @@ impl Emulator {
             let opcode = inst & 0b1111111;
 
             if self.mode == ExecMode::Debug {
-                println!("Executing  {:08b} @ {:08x}\n", opcode, pc);
+                println!("Executing  {opcode:08b} @ {pc:08x}\n");
             }
 
             match opcode {
@@ -518,12 +529,12 @@ impl Emulator {
                             let mode = (inst.imm >> 6) & 0b111111;
 
                             match mode {
-                                0b0000000 => {
+                                0b000000 => {
                                     // SRLI
                                     let shamt = inst.imm & 0b111111;
                                     self.set_reg(inst.rd, rs1 >> shamt);
                                 }
-                                0b0100000 => {
+                                0b010000 => {
                                     // SRAI
                                     let shamt = inst.imm & 0b111111;
                                     self.set_reg(
@@ -799,20 +810,23 @@ mod tests {
     use std::env;
     use std::path::Path;
 
+    /// Tupl of `FileSz` and `MemSz` stored in program headers.
+    pub struct Sizes(usize, usize);
+
     /// This macro builds a test case for a specific RISCV-64 UI binary.
     /// All the test cases have the same structure after being linked and so
     /// they share the same entrypoint 0x80000000 and file offsets of sections
     /// we care about 0x1000 and 0x2000 respectively.
     macro_rules! run_compliance_case {
-        ($name: ident, $file_name: expr) => {
+        ($name: ident, $file_name: expr, $sec1: expr, $sec2: expr) => {
             #[test]
             fn $name() {
                 let mut emu = Emulator::new();
                 let filename = $file_name;
                 let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
-                let path  = Path::new(&env_var).join(filename);
+                let path = Path::new(&env_var).join(filename);
                 let test_app_entry_point = 0x80000000;
-                emu.set_mode(ExecMode::Reset);
+                emu.set_mode(ExecMode::Debug);
 
                 emu.memory
                     .load(
@@ -821,8 +835,8 @@ mod tests {
                             elf::Section {
                                 file_offset: 0x0000000000001000,
                                 virt_addr: mmu::VirtAddr(0x0000000080000000),
-                                file_size: 0x00000000000006bc,
-                                mem_size: 0x00000000000006bc,
+                                file_size: $sec1.0,
+                                mem_size: $sec1.1,
                                 permissions: mmu::Permission(
                                     PERM_READ | PERM_EXEC,
                                 ),
@@ -830,8 +844,8 @@ mod tests {
                             elf::Section {
                                 file_offset: 0x0000000000002000,
                                 virt_addr: mmu::VirtAddr(0x0000000080001000),
-                                file_size: 0x0000000000000048,
-                                mem_size: 0x0000000000000048,
+                                file_size: $sec2.0,
+                                mem_size: $sec2.1,
                                 permissions: mmu::Permission(
                                     PERM_READ | PERM_WRITE,
                                 ),
@@ -865,7 +879,347 @@ mod tests {
             }
         };
     }
-
-    run_compliance_case!(can_pass_compliance_test_rv64i_add, "support/compliance/rv64ui-p-add");
-    run_compliance_case!(can_pass_compliance_test_rv64i_sub, "support/compliance/rv64ui-p-sub");
+    // ADD
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_add,
+        "support/compliance/rv64ui-p-add",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x48, 0x48)
+    );
+    // ADDW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_addw,
+        "support/compliance/rv64ui-p-addw",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x48, 0x48)
+    );
+    // ADDI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_addi,
+        "support/compliance/rv64ui-p-addi",
+        Sizes(0x47c, 0x47c),
+        Sizes(0x48, 0x48)
+    );
+    // ADDIW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_addiw,
+        "support/compliance/rv64ui-p-addiw",
+        Sizes(0x47c, 0x47c),
+        Sizes(0x48, 0x48)
+    );
+    // AND
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_and,
+        "support/compliance/rv64ui-p-and",
+        Sizes(0x73c, 0x73c),
+        Sizes(0x48, 0x48)
+    );
+    // ANDI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_andi,
+        "support/compliance/rv64ui-p-andi",
+        Sizes(0x3bc, 0x3bc),
+        Sizes(0x48, 0x48)
+    );
+    // AUIPC
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_auipc,
+        "support/compliance/rv64ui-p-auipc",
+        Sizes(0x238, 0x238),
+        Sizes(0x48, 0x48)
+    );
+    // BEQ
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_beq,
+        "support/compliance/rv64ui-p-beq",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x48, 0x48)
+    );
+    // BGE
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_bge,
+        "support/compliance/rv64ui-p-bge",
+        Sizes(0x4fc, 0x4fc),
+        Sizes(0x48, 0x48)
+    );
+    // BGEU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_bgeu,
+        "support/compliance/rv64ui-p-bgeu",
+        Sizes(0x5bc, 0x5bc),
+        Sizes(0x48, 0x48)
+    );
+    // BLT
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_blt,
+        "support/compliance/rv64ui-p-blt",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x48, 0x48)
+    );
+    // BLTU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_bltu,
+        "support/compliance/rv64ui-p-bltu",
+        Sizes(0x57c, 0x57c),
+        Sizes(0x48, 0x48)
+    );
+    // BNE
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_bne,
+        "support/compliance/rv64ui-p-bne",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x48, 0x48)
+    );
+    // JAL
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_jal,
+        "support/compliance/rv64ui-p-jal",
+        Sizes(0x23c, 0x23c),
+        Sizes(0x48, 0x48)
+    );
+    // JALR
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_jalr,
+        "support/compliance/rv64ui-p-jalr",
+        Sizes(0x2bc, 0x2bc),
+        Sizes(0x48, 0x48)
+    );
+    // LB
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lb,
+        "support/compliance/rv64ui-p-lb",
+        Sizes(0x43c, 0x43c),
+        Sizes(0x1010, 0x1010)
+    );
+    // LBU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lbu,
+        "support/compliance/rv64ui-p-lbu",
+        Sizes(0x43c, 0x43c),
+        Sizes(0x1010, 0x1010)
+    );
+    // LD
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_ld,
+        "support/compliance/rv64ui-p-ld",
+        Sizes(0x67c, 0x67c),
+        Sizes(0x1020, 0x1020)
+    );
+    // LH
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lh,
+        "support/compliance/rv64ui-p-lh",
+        Sizes(0x47c, 0x47c),
+        Sizes(0x1010, 0x1010)
+    );
+    // LHU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lhu,
+        "support/compliance/rv64ui-p-lhu",
+        Sizes(0x47c, 0x47c),
+        Sizes(0x1010, 0x1010)
+    );
+    // LUI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lui,
+        "support/compliance/rv64ui-p-lui",
+        Sizes(0x23c, 0x23c),
+        Sizes(0x48, 0x48)
+    );
+    // LW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lw,
+        "support/compliance/rv64ui-p-lw",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x1010, 0x1010)
+    );
+    // LWU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_lwu,
+        "support/compliance/rv64ui-p-lwu",
+        Sizes(0x4fc, 0x4fc),
+        Sizes(0x1010, 0x1010)
+    );
+    // OR
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_or,
+        "support/compliance/rv64ui-p-or",
+        Sizes(0x7bc, 0x7bc),
+        Sizes(0x48, 0x48)
+    );
+    // ORI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_ori,
+        "support/compliance/rv64ui-p-ori",
+        Sizes(0x3bc, 0x3bc),
+        Sizes(0x48, 0x48)
+    );
+    // SB
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sb,
+        "support/compliance/rv64ui-p-sb",
+        Sizes(0x63c, 0x63c),
+        Sizes(0x1010, 0x1010)
+    );
+    // SD
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sd,
+        "support/compliance/rv64ui-p-sd",
+        Sizes(0x8bc, 0x8bc),
+        Sizes(0x1050, 0x1050)
+    );
+    // SH
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sh,
+        "support/compliance/rv64ui-p-sh",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x1020, 0x1020)
+    );
+    // SW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sw,
+        "support/compliance/rv64ui-p-sw",
+        Sizes(0x6fc, 0x6fc),
+        Sizes(0x1030, 0x1030)
+    );
+    // SLL
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sll,
+        "support/compliance/rv64ui-p-sll",
+        Sizes(0x7fc, 0x7fc),
+        Sizes(0x48, 0x48)
+    );
+    // SLLI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_slli,
+        "support/compliance/rv64ui-p-slli",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x48, 0x48)
+    );
+    // SLLIW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_slliw,
+        "support/compliance/rv64ui-p-slliw",
+        Sizes(0x4fc, 0x4fc),
+        Sizes(0x48, 0x48)
+    );
+    // SLLW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sllw,
+        "support/compliance/rv64ui-p-sllw",
+        Sizes(0x7fc, 0x7fc),
+        Sizes(0x48, 0x48)
+    );
+    // SLT
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_slt,
+        "support/compliance/rv64ui-p-slt",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x48, 0x48)
+    );
+    // SLTI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_slti,
+        "support/compliance/rv64ui-p-slti",
+        Sizes(0x43c, 0x43c),
+        Sizes(0x48, 0x48)
+    );
+    // SLTIU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sltiu,
+        "support/compliance/rv64ui-p-sltiu",
+        Sizes(0x43c, 0x43c),
+        Sizes(0x48, 0x48)
+    );
+    // SLTU
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sltu,
+        "support/compliance/rv64ui-p-sltu",
+        Sizes(0x6fc, 0x6fc),
+        Sizes(0x48, 0x48)
+    );
+    // SRA
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sra,
+        "support/compliance/rv64ui-p-sra",
+        Sizes(0x77c, 0x77c),
+        Sizes(0x48, 0x48)
+    );
+    // SRAI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_srai,
+        "support/compliance/rv64ui-p-srai",
+        Sizes(0x4bc, 0x4bc),
+        Sizes(0x48, 0x48)
+    );
+    // SRAIW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sraiw,
+        "support/compliance/rv64ui-p-sraiw",
+        Sizes(0x53c, 0x53c),
+        Sizes(0x48, 0x48)
+    );
+    // SRAW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sraw,
+        "support/compliance/rv64ui-p-sraw",
+        Sizes(0x83c, 0x83c),
+        Sizes(0x48, 0x48)
+    );
+    // SRL
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_srl,
+        "support/compliance/rv64ui-p-srl",
+        Sizes(0x7fc, 0x7fc),
+        Sizes(0x48, 0x48)
+    );
+    // SRLI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_srli,
+        "support/compliance/rv64ui-p-srli",
+        Sizes(0x4fc, 0x4fc),
+        Sizes(0x48, 0x48)
+    );
+    // SRLIW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_srliw,
+        "support/compliance/rv64ui-p-srliw",
+        Sizes(0x4fc, 0x4fc),
+        Sizes(0x48, 0x48)
+    );
+    // SRLW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_srlw,
+        "support/compliance/rv64ui-p-srlw",
+        Sizes(0x7fc, 0x7fc),
+        Sizes(0x48, 0x48)
+    );
+    // SUB
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_sub,
+        "support/compliance/rv64ui-p-sub",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x48, 0x48)
+    );
+    // SUBW
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_subw,
+        "support/compliance/rv64ui-p-subw",
+        Sizes(0x6bc, 0x6bc),
+        Sizes(0x48, 0x48)
+    );
+    // XOR
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_xor,
+        "support/compliance/rv64ui-p-xor",
+        Sizes(0x7bc, 0x7bc),
+        Sizes(0x48, 0x48)
+    );
+    // XORI
+    run_compliance_case!(
+        can_pass_compliance_test_rv64i_xori,
+        "support/compliance/rv64ui-p-xori",
+        Sizes(0x3bc, 0x3bc),
+        Sizes(0x48, 0x48)
+    );
 }

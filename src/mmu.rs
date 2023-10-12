@@ -17,7 +17,8 @@
 /// Which fits within our MMU's range.
 ///
 /// Since the Toolchain we have builds all binaries with a base address or
-/// entry point of 0x10000 then we don't need to do the translation.
+/// entry point of 0x10000 then we don't need to do the translation. But to run
+/// the compliance tests for RISC-V we need to support that.
 use crate::elf;
 use crate::emu::VmExit;
 use std::path::Path;
@@ -115,7 +116,7 @@ impl Mmu {
                 .copy_from_slice(&other.permissions[start..end]);
         }
         // Clear the dirty blocks list.
-        self.dirty.clear()
+        self.dirty.clear();
     }
 
     /// Allocate a region in memory as read-writable.
@@ -185,8 +186,8 @@ impl Mmu {
             .copy_from_slice(buf);
 
         // Compute dirty bit blocks.
-        let block_start = addr.0 / DIRTY_BLOCK_SIZE;
-        let block_end = (addr.0 + buf.len()) / DIRTY_BLOCK_SIZE;
+        let block_start = Mmu::translate(addr).0 / DIRTY_BLOCK_SIZE;
+        let block_end = (Mmu::translate(addr).0 + buf.len()) / DIRTY_BLOCK_SIZE;
 
         for block in block_start..=block_end {
             // Determine the bitmap position of the dirty block.
@@ -203,11 +204,11 @@ impl Mmu {
 
         // Update RAW bits.
         if has_raw {
-            perms.iter_mut().for_each(|x| {
+            for x in &mut *perms {
                 if (x.0 & PERM_RAW) != 0 {
                     *x = Permission(x.0 | PERM_READ);
                 }
-            });
+            }
         }
         Ok(())
     }
@@ -236,7 +237,7 @@ impl Mmu {
             &mut buf[..core::mem::size_of::<T>()],
             expected_permissions,
         )?;
-        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr() as *const T) })
+        Ok(unsafe { core::ptr::read_unaligned(buf.as_ptr().cast::<T>()) })
     }
 
     /// Write a type `T` to `addr`.
@@ -252,7 +253,7 @@ impl Mmu {
     ) -> Result<(), VmExit> {
         let buf = unsafe {
             core::slice::from_raw_parts(
-                &value as *const T as *const u8,
+                std::ptr::addr_of!(value).cast::<u8>(),
                 core::mem::size_of::<T>(),
             )
         };
@@ -260,8 +261,14 @@ impl Mmu {
         self.write(addr, buf)
     }
 
-    /// Return an immutable view of memory @ `addr`.
-    pub fn peek_perms(
+    /// Return an immutable view of memory at `addr`.
+    ///
+    /// # Errors
+    ///
+    /// `view` fails if the requested address doesn't exist or is not in range
+    /// with `AddressFault` or if the `READ` permission bit is not set in that
+    /// case `ReadFault`.
+    pub fn view(
         &self,
         addr: VirtAddr,
         size: usize,
@@ -292,6 +299,14 @@ impl Mmu {
 
     /// Read `buf.len()` bytes from `memory` at `addr` into `buf` assuming
     /// permission checks pass.
+    ///
+    /// # Errors
+    ///
+    /// `read_into_perms` fails if it accesses invalid memory, access faults
+    /// are split into two :
+    ///
+    /// - `AddressFault` if the address is not in the allowed or existing range.
+    /// - `ReadFault` if the `READ` bit permission is not set for the range.
     pub fn read_into_perms(
         &self,
         addr: VirtAddr,

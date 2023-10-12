@@ -57,7 +57,11 @@ fn main() {
     let exit_reason = loop {
         let exit_reason = vm.run().expect_err("Failed to run emulator loop.");
         match exit_reason {
-            // Handle syscalls.
+            // Handle syscalls, by convention syscall number is stored in
+            // `Register::A7`, and arguments in registers `Register::A0` to
+            // `Register::A5` with the unused arguments set to `0`.
+            //
+            // The return value is stored in `Register::A0`.
             VmExit::Syscall => {
                 let num = vm.reg(Register::A7);
                 if let Err(exit_reason) = vm.handle_syscall(num) {
@@ -70,5 +74,5 @@ fn main() {
             _ => break exit_reason,
         }
     };
-    println!("VM exited with syscall: {:#x?}", exit_reason);
+    println!("VM exited with syscall: {exit_reason:#x?}");
 }
