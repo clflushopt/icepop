@@ -1,4 +1,7 @@
+use std::sync::{Arc, Mutex};
+
 use icepop::emu::{Emulator, ExecMode, VmExit};
+use icepop::jit::JitCache;
 use icepop::machine::Register;
 use icepop::mmu;
 
@@ -10,11 +13,13 @@ fn main() {
     let mut vm = Emulator::new();
     // Prepare the VM environment.
     vm.prepare();
+    // Set execution mode to JIT.
+    vm.set_mode(ExecMode::Jit);
 
     let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
     let path = Path::new(&env_var).join("support/unit/test_app");
     let test_app_entry_point = 0x11190;
-
+    // Load target binary.
     vm.memory
         .load(
             path,
@@ -51,8 +56,11 @@ fn main() {
     // Set program counter to our test app entry point.
     vm.set_reg(Register::Pc, test_app_entry_point);
 
-    // Disable debug logs.
-    vm.set_mode(ExecMode::Reset);
+    // Fork a single worker.
+    let mut worker = vm.memory.fork();
+    use std::time::Instant;
+    let start = Instant::now();
+
     // VM run loop.
     let exit_reason = loop {
         let exit_reason = vm.run().expect_err("Failed to run emulator loop.");
@@ -74,5 +82,4 @@ fn main() {
             _ => break exit_reason,
         }
     };
-    println!("VM exited with syscall: {exit_reason:#x?}");
 }

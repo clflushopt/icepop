@@ -47,7 +47,7 @@ pub const PERM_EXEC: u8 = 1 << 2;
 pub const PERM_RAW: u8 = 1 << 3;
 
 /// Unit number of bytes that are cleared and reset on each run.
-const DIRTY_BLOCK_SIZE: usize = 4096;
+pub const DIRTY_BLOCK_SIZE: usize = 4096;
 
 /// Strongly typed reference to guest virtual addresses.
 #[repr(transparent)]
@@ -340,12 +340,41 @@ impl Mmu {
         Ok(())
     }
 
-    /// Translate a vitual address to its base relative offset.
+    /// Translate a virtual address to its base relative offset.
     fn translate(addr: VirtAddr) -> VirtAddr {
         if addr.0 >= DEFAULT_EMU_MMU_BASE {
             return VirtAddr(addr.0 - DEFAULT_EMU_MMU_BASE);
         }
         addr
+    }
+
+    /// Get the total size of guest memory.
+    #[inline]
+    pub fn len(&self) -> usize {
+        self.memory.len()
+    }
+
+    /// Get the dirty bits length.
+    #[inline]
+    pub fn dirty_len(&self) -> usize {
+        self.dirty.len()
+    }
+
+    /// Set the dirty bits length.
+    #[inline]
+    pub unsafe fn set_dirty_len(&mut self, len: usize) {
+        self.dirty.set_len(len);
+    }
+
+    /// Get addresses of the fields the JIT will need access to.
+    #[inline]
+    pub fn jit_addrs(&self) -> (usize, usize, usize, usize) {
+        (
+            self.memory.as_ptr() as usize,
+            self.permissions.as_ptr() as usize,
+            self.dirty.as_ptr() as usize,
+            self.dirty_bitmap.as_ptr() as usize,
+        )
     }
 
     /// Load an ELF binary from disk.

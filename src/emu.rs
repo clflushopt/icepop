@@ -1,10 +1,16 @@
 //! 64-bit RISC-V emulator for the user mode base level ISA `RV64i` with
 //! support for memory hooks and just-in-time dynamic recompilation.
+use std::arch::asm;
+use std::process::Command;
+use std::sync::{Arc, Mutex};
+
+use crate::jit::{alloc_rwx, JitCache};
 use crate::machine::{
     Btype, Csr, Itype, Jtype, Register, Rtype, Stype, Utype, MAX_CPU_REGISTERS,
 };
 use crate::mmu::{
-    Mmu, Permission, VirtAddr, DEFAULT_EMU_MMU_SIZE, PERM_EXEC, PERM_READ,
+    Mmu, Permission, VirtAddr, DEFAULT_EMU_MMU_SIZE, DIRTY_BLOCK_SIZE,
+    PERM_EXEC, PERM_READ, PERM_WRITE,
 };
 
 /// Single threaded RISC-V RV64i emulator with an MMU.
@@ -26,6 +32,9 @@ pub struct Emulator {
 
     /// List of hooks to run after performing an IO operation.
     post: Vec<fn()>,
+
+    /// Cache of jitted blocks.
+    jit_cache: Option<Arc<JitCache>>,
 }
 
 /// Execution mode for the Emulator, note that `Debug` mode writes to `stdout`
@@ -70,11 +79,16 @@ impl Emulator {
             mode: ExecMode::Debug,
             pre: vec![],
             post: vec![],
+            jit_cache: None,
         }
     }
 
     /// Mode sets the `ExecMode` on the emulator.
     pub fn set_mode(&mut self, mode: ExecMode) {
+        if mode == ExecMode::Jit {
+            let mut jit_cache = Arc::new(JitCache::new(VirtAddr(1024 * 1024)));
+            self.jit_cache = Some(jit_cache);
+        }
         self.mode = mode;
     }
 
@@ -121,6 +135,19 @@ impl Emulator {
     pub fn reset(&mut self, other: &Self) {
         self.memory.reset(&other.memory);
         self.registers = other.registers;
+    }
+
+    /// Fork an existing emulator to a new one with the same state.
+    pub fn fork(&self) -> Self {
+        Self {
+            memory: self.memory.fork(),
+            registers: self.registers.clone(),
+            csrs: self.csrs.clone(),
+            mode: self.mode,
+            pre: self.pre.clone(),
+            post: self.post.clone(),
+            jit_cache: self.jit_cache.clone(),
+        }
     }
 
     /// Read a register.
@@ -222,6 +249,133 @@ impl Emulator {
 
     /// Run the emulator loop.
     pub fn run(&mut self) -> Result<(), VmExit> {
+        if self.mode == ExecMode::Jit {
+            self.run_jit()
+        } else {
+            self.run_emu()
+        }
+    }
+
+    /// Run the emulator in Jit mode.
+    pub fn run_jit(&mut self) -> Result<(), VmExit> {
+        // Load the translation table.
+        let tlb = self.jit_cache.as_ref().unwrap().translation_table();
+
+        let (memory, perms, dirty, dirty_bitmap) = self.memory.jit_addrs();
+        let mut override_jit_addr = None;
+
+        loop {
+            let jit_addr =
+                if let Some(override_jit_addr) = override_jit_addr.take() {
+                    override_jit_addr
+                } else {
+                    // Load the current PC
+                    let pc = self.reg(Register::Pc);
+                    let (jit_addr, num_blocks) = {
+                        let jit_cache = self.jit_cache.as_ref().unwrap();
+                        (
+                            jit_cache.lookup(VirtAddr(pc as usize)),
+                            jit_cache.num_blocks(),
+                        )
+                    };
+
+                    if let Some(jit_addr) = jit_addr {
+                        jit_addr
+                    } else {
+                        // Compile every instruction in the current block
+                        // to be assembled.
+                        let asm = self
+                            .generate_jit(VirtAddr(pc as usize), num_blocks)?;
+
+                        // Write the assembly to a temporary file.
+                        let asmfn = std::env::temp_dir().join(format!(
+                            "fwetmp_{:?}.asm",
+                            std::thread::current().id()
+                        ));
+                        let binfn = std::env::temp_dir().join(format!(
+                            "fwetmp_{:?}.bin",
+                            std::thread::current().id()
+                        ));
+                        std::fs::write(&asmfn, &asm)
+                            .expect("Failed to write out assembly");
+
+                        // Invoke NASM to generate the binary.
+                        let res = Command::new("nasm")
+                            .args(&[
+                                "-f",
+                                "bin",
+                                "-o",
+                                binfn.to_str().unwrap(),
+                                asmfn.to_str().unwrap(),
+                            ])
+                            .status()
+                            .expect("Failed to run nasm, is it in the path");
+                        assert!(res.success(), "nasm exited with an error");
+
+                        // Load the assembled binary and update the JIT cache.
+                        let tmp = std::fs::read(&binfn)
+                            .expect("Failed to read nasm output");
+                        self.jit_cache
+                            .as_ref()
+                            .unwrap()
+                            .add_mapping(VirtAddr(pc as usize), &tmp)
+                    }
+                };
+            unsafe {
+                // Invoke the jit
+                let exit_code: u64;
+                let reentry_pc: u64;
+                let exit_info: u64;
+
+                let dirty_inuse = self.memory.dirty_len();
+                let new_dirty_inuse: usize;
+
+                asm!(r#"
+                    call {entry}
+                    "#,
+                entry = in(reg) jit_addr,
+                out("rax") exit_code,
+                out("rsi") reentry_pc,
+                out("rdx") _,
+                in("r8") memory,
+                in("r9") perms,
+                in("r10") dirty,
+                in("r11") dirty_bitmap,
+                inout("r12") dirty_inuse => new_dirty_inuse,
+                in("r13") self.registers.as_ptr(),
+                in("r14") tlb,
+                );
+
+                // Update the program counter reentry point
+                self.set_reg(Register::Pc, reentry_pc);
+                // Update the dirty state
+                self.memory.set_dirty_len(new_dirty_inuse);
+
+                match exit_code {
+                    1 => {
+                        // Branch decode request, continue as PC has been updated
+                        // to new target branch.
+                    }
+                    2 => {
+                        // Syscall
+                        return Err(VmExit::Syscall);
+                    }
+                    4 => {
+                        // Read fault
+                        return Err(VmExit::ReadFault(VirtAddr(reentry_pc as usize)));
+                    }
+                    5 => {
+                        // Write fault
+                        return Err(VmExit::WriteFault(VirtAddr(reentry_pc as usize)));
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+    }
+
+    /// Run the emulator in interpreter mode.
+    pub fn run_emu(&mut self) -> Result<(), VmExit> {
         'next_inst: loop {
             // Get current Pc.
             let pc = self.reg(Register::Pc);
@@ -795,6 +949,957 @@ impl Emulator {
             // Increment PC to the next instruction.
             self.set_reg(Register::Pc, pc.wrapping_add(4));
         }
+    }
+
+    /// Generate the assembly for `pc`.
+    pub fn generate_jit(
+        &mut self,
+        pc: VirtAddr,
+        num_blocks: usize,
+    ) -> Result<String, VmExit> {
+        let mut asm = "[bits 64]\n".to_string();
+
+        let mut pc = pc.0 as u64;
+        let mut block_instrs = 0;
+
+        'next_inst: loop {
+            // Check that the program counter is aligned.
+            if pc & 3 != 0 {
+                return Err(VmExit::AddressFault(VirtAddr(pc as usize), 0));
+            }
+            // Read the next instruction in this block.
+            let inst: u32 = self
+                .memory
+                .read_into::<u32>(VirtAddr(pc as usize), Permission(PERM_EXEC))
+                .map_err(|x| VmExit::AddressFault(VirtAddr(pc as usize), 0))?;
+            // Extract the opcode.
+            let opcode = inst & 0b1111111;
+
+            // Label this instruction.
+            asm += &format!("inst_pc_{:#x}:\n", pc);
+
+            // Generate an assembly statement equivalent to a load.
+            macro_rules! load_reg {
+                    ($x86reg:expr, $reg:expr) => {
+                        // Reading from the zero register is equivalent to clearing the destination
+                        // register.
+                        if $reg == Register::Zero  {
+                            format!("xor {x86reg}, {x86reg}\n", x86reg = $x86reg)
+                        } else {
+                            // Otherwise emit a `mov`, `self.registers` is passed in `r13` and each
+                            // register is 8 bytes long so the offset uses the base, index with
+                            // scale approach.
+                            format!("mov {x86reg}, qword [r13 + {reg} * 8]\n",
+                                x86reg = $x86reg, reg = $reg as usize)
+                        }
+                    }
+                }
+
+            // Emit a store.
+            macro_rules! store_reg {
+                ($reg: expr, $x86reg: expr) => {
+                    // Nothing to do here.
+                    if $reg == Register::Zero {
+                        String::new()
+                    } else {
+                        format!(
+                            "mov qword [r13 + {reg} * 8], {x86reg}\n",
+                            reg = $reg as usize,
+                            x86reg = $x86reg
+                        )
+                    }
+                };
+            }
+
+            // Codegen the instructions in the block.
+            match opcode {
+                0b0110111 => {
+                    // LUI
+                    let inst = Utype::from(inst);
+                    asm += &store_reg!(inst.rd, inst.imm);
+                }
+                0b0010111 => {
+                    // AUIPC
+                    let inst = Utype::from(inst);
+                    let val = (inst.imm as i64 as u64).wrapping_add(pc);
+                    asm += &format!(
+                        r#"\
+                            mov rax, {imm:#x}
+                            {store_rd_from_rax}
+                        "#,
+                        imm = val,
+                        store_rd_from_rax = store_reg!(inst.rd, "rax")
+                    );
+                }
+                0b1101111 => {
+                    // JAL
+                    let inst = Jtype::from(inst);
+
+                    // Compute the return address
+                    let ret = pc.wrapping_add(4);
+
+                    // Compute the branch target
+                    let target = pc.wrapping_add(inst.imm as i64 as u64);
+
+                    if (target / 4) >= num_blocks as u64 {
+                        // Branch target is out of bounds.
+                        panic!("Target branch is out of bounds");
+                    }
+                    asm += &format!(
+                        r#"
+                        mov rax, {ret}
+                        {store_rd_from_rax}
+
+                        mov rax, [r14 + {target}]
+                        test rax, rax
+                        jz .jit_resolve
+
+                        jmp rax
+
+                        .jit_resolve:
+                        mov rax, 1
+                        mov rsi, {target_pc}
+                        ret
+                        "#,
+                        ret = ret,
+                        target_pc = target,
+                        store_rd_from_rax = store_reg!(inst.rd, "rax"),
+                        target = (target / 4) * 8
+                    );
+                    // Exit the current block and go to target.
+                    break 'next_inst;
+                }
+                0b1100111 => {
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // JALR
+
+                            // Compute the return address.
+                            let ret = pc.wrapping_add(4);
+
+                            asm += &format!(
+                                r#"
+                                mov rax, {ret}
+                                {store_rd_from_rax}
+
+                                {load_rax_from_rs1}
+                                add rax, {imm}
+
+                                shr rax, 2
+                                cmp rax, {num_blocks}
+                                jae .jit_resolve
+
+                                mov rax, [r14 + rax * 8]
+                                test rax, rax
+                                jz .jit_resolve
+
+                                jmp rax
+
+                                .jit_resolve:
+                                {load_rsi_from_rs1}
+                                add rsi, {imm}
+                                mov rax, 1
+                                ret
+                            "#,
+                                imm = inst.imm,
+                                ret = ret,
+                                store_rd_from_rax = store_reg!(inst.rd, "rax"),
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs1 = load_reg!("rsi", inst.rs1),
+                                num_blocks = num_blocks
+                            );
+                            break 'next_inst;
+                        }
+                        _ => unimplemented!("Unexpected 0b1100111"),
+                    }
+                }
+                0b1100011 => {
+                    let inst = Btype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 | 0b001 | 0b100 | 0b101 | 0b111 => {
+                            let cond = match inst.funct3 {
+                                // Map conditional juimp from RISC-V to x86
+                                0b000 =>
+                                /* BEQ */
+                                {
+                                    "jne"
+                                }
+                                0b001 =>
+                                /* BNE */
+                                {
+                                    "je"
+                                }
+                                0b100 =>
+                                /* BLT */
+                                {
+                                    "jnl"
+                                }
+                                0b101 =>
+                                /* BGE */
+                                {
+                                    "jnge"
+                                }
+                                0b110 =>
+                                /* BLTU */
+                                {
+                                    "jnb"
+                                }
+                                0b111 =>
+                                /* BGEU */
+                                {
+                                    "jnae"
+                                }
+                                _ => unreachable!(),
+                            };
+
+                            let target =
+                                pc.wrapping_add(inst.imm as i64 as u64);
+
+                            if (target / 4) >= num_blocks as u64 {
+                                // Branch target is out of bounds.
+                                panic!("Target branch is out of bounds");
+                            }
+
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+
+                                cmp rax, rsi
+                                {cond} .fallthrough
+
+                                mov rax, [r14 + {target}]
+                                test rax, rax
+                                jz .jit_resolve
+
+                                jmp rax
+
+                                .jit_resolve:
+                                mov rax, 1
+                                mov rsi, {target_pc}
+                                ret
+
+                                .fallthrough:
+                            "#,
+                                cond = cond,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                target_pc = target,
+                                target = (target / 4) * 8
+                            );
+                        }
+                        _ => unimplemented!("Unexpected 0b1100011"),
+                    }
+                }
+                0b0000011 => {
+                    let inst = Itype::from(inst);
+
+                    let (loadtyp, loadsz, regtyp, access_size) =
+                        match inst.funct3 {
+                            0b000 =>
+                            /* LB */
+                            {
+                                ("movsx", "byte", "rsi", 1)
+                            }
+                            0b001 =>
+                            /* LH */
+                            {
+                                ("movsx", "word", "rsi", 2)
+                            }
+                            0b010 =>
+                            /* LW */
+                            {
+                                ("movsx", "dword", "rsi", 4)
+                            }
+                            0b011 =>
+                            /* LD */
+                            {
+                                ("mov", "qword", "rsi", 8)
+                            }
+                            0b100 =>
+                            /* LBU */
+                            {
+                                ("movzx", "byte", "rsi", 1)
+                            }
+                            0b101 =>
+                            /* LHU */
+                            {
+                                ("movzx", "word", "rsi", 2)
+                            }
+                            0b110 =>
+                            /* LWU */
+                            {
+                                ("mov", "dword", "esi", 4)
+                            }
+                            _ => unreachable!(),
+                        };
+                    // Compute the read permission mask.
+                    let mut perm_mask = 0u64;
+                    for ii in 0..access_size {
+                        perm_mask |= (PERM_READ as u64) << (ii * 8)
+                    }
+
+                    asm += &format!(
+                        r#"
+                    {load_rax_from_rs1}
+                    add rax, {imm}
+
+                    cmp rax, {memory_len} - {access_size}
+                    ja .fault
+
+                    {loadtyp} {regtyp}, {loadsz} [r9 + rax]
+                    mov rcx, {perm_mask}
+                    and rsi, rcx
+                    cmp rsi, rcx
+                    je .nofault
+
+                    .fault:
+                    mov rcx, rax
+                    mov rsi, {pc}
+                    mov rax, 4
+                    ret
+
+                    .nofault:
+                    {loadtyp} {regtyp}, {loadsz} [r8 + rax]
+                    {store_rsi_into_rd}
+                    "#,
+                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                        store_rsi_into_rd = store_reg!(inst.rd, "rsi"),
+                        loadtyp = loadtyp,
+                        loadsz = loadsz,
+                        regtyp = regtyp,
+                        pc = pc,
+                        access_size = access_size,
+                        perm_mask = perm_mask,
+                        memory_len = self.memory.len(),
+                        imm = inst.imm
+                    );
+                }
+                0b0100011 => {
+                    let inst = Stype::from(inst);
+                    let (loadtyp, loadsz, regtype, loadrt, access_size) =
+                        match inst.funct3 {
+                            0b000 =>
+                            /* SB */
+                            {
+                                ("movzx", "byte", "sil", "esi", 1)
+                            }
+                            0b001 =>
+                            /* SH */
+                            {
+                                ("movzs", "word", "si", "esi", 2)
+                            }
+                            0b010 =>
+                            /* SW */
+                            {
+                                ("mov", "dword", "esi", "esi", 4)
+                            }
+                            0b011 =>
+                            /* SD */
+                            {
+                                ("mov", "qword", "rsi", "rsi", 8)
+                            }
+                            _ => unreachable!(),
+                        };
+
+                    assert!(
+                        DIRTY_BLOCK_SIZE.count_ones() == 1
+                            && DIRTY_BLOCK_SIZE >= 8,
+                        "Dirty block size must be a power of two and >= 8"
+                    );
+                    // Shift amount to get the block from an address.
+                    let dirty_block_shift = DIRTY_BLOCK_SIZE.trailing_zeros();
+
+                    // Compute the write permission mask
+                    let mut perm_mask = 0u64;
+                    for ii in 0..access_size {
+                        perm_mask |= (PERM_WRITE as u64) << (ii * 8)
+                    }
+
+                    asm += &format!(
+                        r#"
+                        {load_rax_from_rs1}
+                        add rax, {imm}
+
+                        cmp rax, {memory_len} - {access_size}
+                        ja .fault
+
+                        {loadtyp} {loadrt}, {loadsz} [r9 + rax]
+                        mov rcx, {perm_mask}
+                        mov rdx, rsi
+                        and rsi, rcx
+                        cmp rsi, rcx
+                        je .nofault
+
+                        .fault:
+                        mov rcx, rax
+                        mov rsi, {pc}
+                        mov rax, 5
+                        ret
+
+                        .nofault:
+                        shl rcx, 2
+                        and rdx, rcx
+                        shr rdx, 3
+                        mov rsi, rdx
+                        or {loadsz} [r9 + rax], {regtype}
+
+                        mov rcx, rax
+                        shr rcx, {dirty_block_shift}
+                        bts qword [r11], rcx
+                        jc .continue
+
+                        mov qword [r10 + r12 * 8], rcx
+                        add r12, 1
+
+                        .continue
+                        {load_rsi_from_rs2}
+                        mov {loadsz} [r8 + rax], {regtype}
+                    "#,
+                        load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                        load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                        loadtyp = loadtyp,
+                        loadsz = loadsz,
+                        regtype = regtype,
+                        imm = inst.imm,
+                        loadrt = loadrt,
+                        access_size = access_size,
+                        perm_mask = perm_mask,
+                        memory_len = self.memory.len(),
+                        pc = pc,
+                        dirty_block_shift = dirty_block_shift,
+                    );
+                }
+                0b0010011 => {
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDI
+                            asm += &format!(
+                                r#"
+                            {load_rax_from_rs1}
+                            add rax, {imm}
+                            {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm
+                            );
+                        }
+                        0b010 => {
+                            // SLTI
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                xor esi, esi
+                                cmp rax, {imm}
+                                setl sil
+                                {store_rsi_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rsi_into_rd = store_reg!(inst.rd, "rsi"),
+                                imm = inst.imm,
+                            );
+                        }
+                        0b011 => {
+                            // SLTIU
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                xor esi, esi
+                                cmp rax, {imm}
+                                setb sil
+                                {store_rsi_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rsi_into_rd = store_reg!(inst.rd, "rsi"),
+                                imm = inst.imm
+                            );
+                        }
+                        0b100 => {
+                            // XORI
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                xor rax, {imm}
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm
+                            );
+                        }
+                        0b110 => {
+                            // ORI
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                or rax, {imm}
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm
+                            );
+                        }
+                        0b111 => {
+                            // ANDI
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                and rax, {imm}
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm
+                            );
+                        }
+
+                        0b001 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+
+                            match mode {
+                                0b000000 => {
+                                    // SLLI
+                                    let shamt = inst.imm & 0b111111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        shl rax, {imm}
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        0b101 => {
+                            let mode = (inst.imm >> 6) & 0b111111;
+
+                            match mode {
+                                0b000000 => {
+                                    // SRLI
+                                    let shamt = inst.imm & 0b111111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        shr rax, {imm}
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                0b010000 => {
+                                    // SRAI
+                                    let shamt = inst.imm & 0b111111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        sar rax, {imm}
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                0b0110011 => {
+                    // We know it's an Rtype
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADD
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                add rax, rsi
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0100000, 0b000) => {
+                            // SUB
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                sub rax, rsi
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b001) => {
+                            // SLL
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shl rax, cl
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b010) => {
+                            // SLT
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                xor  ecx, ecx
+                                cmp  rax, rsi
+                                setl cl
+                                {store_rcx_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rcx_into_rd = store_reg!(inst.rd, "rcx")
+                            );
+                        }
+                        (0b0000000, 0b011) => {
+                            // SLTU
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                xor  ecx, ecx
+                                cmp  rax, rsi
+                                setb cl
+                                {store_rcx_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rcx_into_rd = store_reg!(inst.rd, "rcx")
+                            );
+                        }
+                        (0b0000000, 0b100) => {
+                            // XOR
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                xor rax, rsi
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b101) => {
+                            // SRL
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shr rax, cl
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0100000, 0b101) => {
+                            // SRA
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                sar rax, cl
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b110) => {
+                            // OR
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                or rax, rsi
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b111) => {
+                            // AND
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                and rax, rsi
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b0111011 => {
+                    // We know it's an Rtype
+                    let inst = Rtype::from(inst);
+
+                    match (inst.funct7, inst.funct3) {
+                        (0b0000000, 0b000) => {
+                            // ADDW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                add eax, esi
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0100000, 0b000) => {
+                            // SUBW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rsi_from_rs2}
+                                sub eax, esi
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rsi_from_rs2 = load_reg!("rsi", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b001) => {
+                            // SLLW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shl eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0000000, 0b101) => {
+                            // SRLW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                shr eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        (0b0100000, 0b101) => {
+                            // SRAW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                {load_rcx_from_rs2}
+                                sar eax, cl
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                load_rcx_from_rs2 = load_reg!("rcx", inst.rs2),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax")
+                            );
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b0001111 => {
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // FENCE
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+                0b1110011 => {
+                    if inst == 0b00000000000000000000000001110011 {
+                        // ECALL
+                        asm += &format!(
+                            r#"
+                            mov rax, 2
+                            mov rsi, {pc}
+
+                            ret
+                        "#,
+                            pc = pc,
+                        );
+                    } else if inst == 0b00000000000100000000000001110011 {
+                        // EBREAK
+                        asm += &format!(
+                            r#"
+                            mov rax, 3
+                            mov rsi, {pc}
+
+                            ret
+                        "#,
+                            pc = pc,
+                        );
+                    } else {
+                        unreachable!();
+                    }
+                }
+                0b0011011 => {
+                    // We know it's an Itype
+                    let inst = Itype::from(inst);
+
+                    match inst.funct3 {
+                        0b000 => {
+                            // ADDIW
+                            asm += &format!(
+                                r#"
+                                {load_rax_from_rs1}
+                                add eax, {imm}
+                                movsx rax, eax
+                                {store_rax_into_rd}
+                            "#,
+                                load_rax_from_rs1 = load_reg!("rax", inst.rs1),
+                                store_rax_into_rd = store_reg!(inst.rd, "rax"),
+                                imm = inst.imm
+                            );
+                        }
+                        0b001 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+
+                            match mode {
+                                0b0000000 => {
+                                    // SLLIW
+                                    let shamt = inst.imm & 0b11111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        shl eax, {imm}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        0b101 => {
+                            let mode = (inst.imm >> 5) & 0b1111111;
+
+                            match mode {
+                                0b0000000 => {
+                                    // SRLIW
+                                    let shamt = inst.imm & 0b11111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        shr eax, {imm}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                0b0100000 => {
+                                    // SRAIW
+                                    let shamt = inst.imm & 0b11111;
+                                    asm += &format!(
+                                        r#"
+                                        {load_rax_from_rs1}
+                                        sar eax, {imm}
+                                        movsx rax, eax
+                                        {store_rax_into_rd}
+                                    "#,
+                                        load_rax_from_rs1 =
+                                            load_reg!("rax", inst.rs1),
+                                        store_rax_into_rd =
+                                            store_reg!(inst.rd, "rax"),
+                                        imm = shamt
+                                    );
+                                }
+                                _ => unreachable!(),
+                            }
+                        }
+                        _ => unreachable!(),
+                    }
+                }
+
+                _ => {
+                    asm += &format!(
+                        r#"
+                        mov rax, 8
+                        mov rsi, {pc}
+                        red
+                    "#,
+                        pc = pc
+                    );
+                }
+            }
+            pc += 4;
+        }
+        Ok(asm)
     }
 }
 
