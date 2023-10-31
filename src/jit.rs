@@ -1,4 +1,4 @@
-//! x86-64 Jit cache for dynamic recompilation of RISC-V instructions.
+//! x86-64 thread safe Jit cache for RISCV emulation.
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
@@ -26,7 +26,7 @@ pub fn alloc_rwx(size: usize) -> &'static mut [u8] {
     }
 }
 
-/// Cache responsible for stroing cached jitted blocks and their corresponding
+/// Cache responsible for storing cached jitted blocks and their corresponding
 /// translation tables.
 ///
 /// Suppose we compile a block at address 0x4000 then the translation table is

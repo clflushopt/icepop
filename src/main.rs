@@ -19,7 +19,7 @@ fn main() {
     let env_var = env::var("CARGO_MANIFEST_DIR").unwrap();
     let path = Path::new(&env_var).join("support/unit/test_app");
     let test_app_entry_point = 0x11190;
-    // Load target binary.
+    // Load test_app target binary.
     vm.memory
         .load(
             path,
@@ -52,7 +52,6 @@ fn main() {
             ],
         )
         .expect("Failed to read test binary");
-
     // Set program counter to our test app entry point.
     vm.set_reg(Register::Pc, test_app_entry_point);
 
@@ -77,9 +76,13 @@ fn main() {
                 }
                 let pc = vm.reg(Register::Pc);
                 vm.set_reg(Register::Pc, pc.wrapping_add(4));
+                println!("VM Exited with code: {:?}", exit_reason);
             }
             // Exit the Vm if `exit_reason` is anythign other than `VmExit::Syscall`.
-            _ => break exit_reason,
+            _ => {
+                println!("VM Exited with code: {:?}", exit_reason);
+                break exit_reason
+            }
         }
     };
 }

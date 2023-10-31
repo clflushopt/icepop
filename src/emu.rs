@@ -45,7 +45,9 @@ pub enum ExecMode {
     Debug,
     // Reset mode will reset the VM on each `VmExit`.
     Reset,
-    // Jit mode will turn on the Jit.
+    // Emulator mode will run the emulator using the interpreter.
+    Emu,
+    // Jit mode will run the emulator using the JIT.
     Jit,
 }
 
@@ -362,11 +364,15 @@ impl Emulator {
                     }
                     4 => {
                         // Read fault
-                        return Err(VmExit::ReadFault(VirtAddr(reentry_pc as usize)));
+                        return Err(VmExit::ReadFault(VirtAddr(
+                            reentry_pc as usize,
+                        )));
                     }
                     5 => {
                         // Write fault
-                        return Err(VmExit::WriteFault(VirtAddr(reentry_pc as usize)));
+                        return Err(VmExit::WriteFault(VirtAddr(
+                            reentry_pc as usize,
+                        )));
                     }
                     _ => unreachable!(),
                 }
@@ -951,7 +957,7 @@ impl Emulator {
         }
     }
 
-    /// Generate the assembly for `pc`.
+    /// Generate the assembly for the basic block at the given `pc`.
     pub fn generate_jit(
         &mut self,
         pc: VirtAddr,
@@ -1355,7 +1361,7 @@ impl Emulator {
                         mov qword [r10 + r12 * 8], rcx
                         add r12, 1
 
-                        .continue
+                        .continue:
                         {load_rsi_from_rs2}
                         mov {loadsz} [r8 + rax], {regtype}
                     "#,
