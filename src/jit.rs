@@ -91,9 +91,8 @@ impl JitCache {
         }
     }
 
-    /// Update the JIT cache for a given virtual address and return the JIT address
-    /// of the new block corresponding to `addr`.
-    pub fn add_mapping(&self, addr: VirtAddr, code: &[u8]) -> usize {
+    /// Update the jitted block at given `addr` and return its new offset.
+    pub fn update(&self, addr: VirtAddr, code: &[u8]) -> usize {
         // Ensure address is aligned.
         assert!(addr.0 & 3 == 0, "Unaligned code address");
 

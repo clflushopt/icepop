@@ -320,7 +320,7 @@ impl Emulator {
                         self.jit_cache
                             .as_ref()
                             .unwrap()
-                            .add_mapping(VirtAddr(pc as usize), &tmp)
+                            .update(VirtAddr(pc as usize), &tmp)
                     }
                 };
             unsafe {
