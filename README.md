@@ -1,6 +1,9 @@
 # icepop
 
 `icepop` is a rewrite of [`riscvemu`](https://github.com/jmpnz/riscvemu) in Rust
-with support for JIT compilation, ~hooks and introspection.~
+with dynamic translation (x86 JIT) aimed towards emulating full RISC-V binaries
+with ~hooks and introspection.~
 
-Currently the emulator passes the full RISC-V compliance test suite.
+Currently supports dynamic translation to x86, with aarch64 a work in progress.
+
+Hooking and introspection are currently not implemented.

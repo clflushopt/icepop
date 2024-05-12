@@ -1,11 +1,12 @@
 //! 64-bit RISC-V emulator for the user mode base level ISA `RV64i` with
 //! support for memory hooks and just-in-time dynamic recompilation.
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use crate::jit::alloc_rwx;
 use std::arch::asm;
 use std::process::Command;
 use std::sync::{Arc, Mutex};
 
-#[cfg(target_os = "linux")]
-use crate::jit::{alloc_rwx, JitCache};
 use crate::machine::{
     Btype, Csr, Itype, Jtype, Register, Rtype, Stype, Utype, MAX_CPU_REGISTERS,
 };
@@ -35,7 +36,7 @@ pub struct Emulator {
     post: Vec<fn()>,
 
     /// Cache of jitted blocks.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     jit_cache: Option<Arc<JitCache>>,
 }
 
@@ -83,14 +84,15 @@ impl Emulator {
             mode: ExecMode::Debug,
             pre: vec![],
             post: vec![],
-            #[cfg(target_os = "linux")]
+
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             jit_cache: None,
         }
     }
 
     /// Mode sets the `ExecMode` on the emulator.
     pub fn set_mode(&mut self, mode: ExecMode) {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if mode == ExecMode::Jit {
             let mut jit_cache = Arc::new(JitCache::new(VirtAddr(1024 * 1024)));
             self.jit_cache = Some(jit_cache);
@@ -152,7 +154,7 @@ impl Emulator {
             mode: self.mode,
             pre: self.pre.clone(),
             post: self.post.clone(),
-            #[cfg(target_os = "linux")]
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
             jit_cache: self.jit_cache.clone(),
         }
     }
@@ -256,15 +258,20 @@ impl Emulator {
 
     /// Run the emulator loop.
     pub fn run(&mut self) -> Result<(), VmExit> {
-        #[cfg(target_os = "linux")]
+        #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
         if self.mode == ExecMode::Jit {
             self.run_jit()
         }
         self.run_emu()
     }
 
-    /// Run the emulator in Jit mode.
-    #[cfg(target_os = "linux")]
+    /// Run the emulator in Jit mode, when runing under jit mode on Linux amd64
+    /// we execute in a dynamic translation mode where RISC-V instructions are
+    /// translated to x64 NASM, the nasm binary is then invoked to assemble
+    /// the code and we cache it in the local cache
+    ///
+    /// Under macOS/aarch64.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub fn run_jit(&mut self) -> Result<(), VmExit> {
         // Load the translation table.
         let tlb = self.jit_cache.as_ref().unwrap().translation_table();
@@ -964,7 +971,7 @@ impl Emulator {
     }
 
     /// Generate the assembly for the basic block at the given `pc`.
-    #[cfg(target_os = "linux")]
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     pub fn generate_jit(
         &mut self,
         pc: VirtAddr,

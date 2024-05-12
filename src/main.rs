@@ -1,10 +1,10 @@
 use std::sync::{Arc, Mutex};
 
 use icepop::emu::{Emulator, ExecMode, VmExit};
-#[cfg(target_os = "linux")]
-use icepop::jit::JitCache;
 use icepop::machine::Register;
 use icepop::mmu;
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+use icepop::x86::JitCache;
 
 fn main() {
     use icepop::elf;
