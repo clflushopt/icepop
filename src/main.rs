@@ -1,6 +1,7 @@
 use std::sync::{Arc, Mutex};
 
 use icepop::emu::{Emulator, ExecMode, VmExit};
+#[cfg(target_os = "linux")]
 use icepop::jit::JitCache;
 use icepop::machine::Register;
 use icepop::mmu;
@@ -56,7 +57,7 @@ fn main() {
     vm.set_reg(Register::Pc, test_app_entry_point);
 
     // Fork a single worker.
-    let mut worker = vm.memory.fork();
+    let mut runer = vm.memory.fork();
     use std::time::Instant;
     let start = Instant::now();
 
@@ -70,18 +71,23 @@ fn main() {
             //
             // The return value is stored in `Register::A0`.
             VmExit::Syscall => {
+                let stop = Instant::now();
                 let num = vm.reg(Register::A7);
                 if let Err(exit_reason) = vm.handle_syscall(num) {
                     break exit_reason;
                 }
                 let pc = vm.reg(Register::Pc);
                 vm.set_reg(Register::Pc, pc.wrapping_add(4));
-                println!("VM Exited with code: {:?}", exit_reason);
+                println!(
+                    "VM Exited with code: {:?} took {} seconds",
+                    exit_reason,
+                    (stop - start).as_secs(),
+                );
             }
             // Exit the Vm if `exit_reason` is anythign other than `VmExit::Syscall`.
             _ => {
                 println!("VM Exited with code: {:?}", exit_reason);
-                break exit_reason
+                break exit_reason;
             }
         }
     };

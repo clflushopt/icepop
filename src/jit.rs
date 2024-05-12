@@ -39,6 +39,7 @@ pub fn alloc_rwx(size: usize) -> &'static mut [u8] {
 /// - Saved : (rbx since it will store the PC for the guest).
 /// - Parameter passing registers : (r8, r9, r10, r11, r12, r13, r14).
 /// - Return value (in rax and will return an equivalent exit code).
+#[cfg(target_os = "linux")]
 pub struct JitCache {
     /// Translation tables for the jitted blocks available for execution.
     tlb: Box<[AtomicUsize]>,
@@ -48,6 +49,7 @@ pub struct JitCache {
     in_use: usize,
 }
 
+#[cfg(target_os = "linux")]
 impl JitCache {
     /// Create a new `JitCache` and allocate backing executable memory for it.
     pub fn new(max_guest_addr: VirtAddr) -> Self {
